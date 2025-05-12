@@ -1,0 +1,372 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IAM Key Rotation with 30-minute rotation period and monitoring'
+
+Parameters:
+  RotationPeriod:
+    Type: Number
+    Default: 0.5
+    Description: 'Number of hours after which a key should be rotated (0.5 = 30 minutes)'
+  
+  InactivePeriod:
+    Type: Number
+    Default: 1
+    Description: 'Number of hours after which to inactivate keys'
+  
+  InactiveBuffer:
+    Type: Number
+    Default: 0.5
+    Description: 'Grace period between rotation and deactivation (30 minutes)'
+  
+  RecoveryGracePeriod:
+    Type: Number
+    Default: 0.5
+    Description: 'Recovery grace period between deactivation and deletion (30 minutes)'
+  
+  AdminEmail:
+    Type: String
+    Description: 'Admin email address for notifications'
+  
+  SenderEmail:
+    Type: String
+    Description: 'Sender email address for notifications'
+
+Resources:
+  KeyRotationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KeyRotationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:CreateAccessKey
+                  - iam:DeleteAccessKey
+                  - iam:ListAccessKeys
+                  - iam:UpdateAccessKey
+                  - iam:GetUser
+                  - iam:ListUserTags
+                  - iam:ListUsers
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  KeyRotationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt KeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import datetime
+          import os
+          
+          def put_metric(user, status):
+              cloudwatch = boto3.client('cloudwatch')
+              cloudwatch.put_metric_data(
+                  Namespace='IAMKeyRotation',
+                  MetricData=[
+                      {
+                          'MetricName': 'KeyRotationStatus',
+                          'Value': 1,
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'User', 'Value': user},
+                              {'Name': 'Status', 'Value': status}
+                          ]
+                      }
+                  ]
+              )
+          
+          def get_user_email(username):
+              """Get user's email from IAM tags or return admin email"""
+              iam = boto3.client('iam')
+              try:
+                  # First try to get email from user tags
+                  response = iam.list_user_tags(UserName=username)
+                  for tag in response.get('Tags', []):
+                      if tag['Key'].lower() == 'email':
+                          return tag['Value']
+                  
+                  # If no email tag, try to get from user attributes
+                  user = iam.get_user(UserName=username)
+                  if 'Email' in user['User']:
+                      return user['User']['Email']
+              except Exception as e:
+                  print(f"Error getting email for {username}: {str(e)}")
+              
+              # Return admin email as fallback
+              return os.environ['ADMIN_EMAIL']
+          
+          def send_notification_email(username, key_status, new_key=None, old_key=None):
+              """Send notification email with detailed information"""
+              ses = boto3.client('ses')
+              sender = os.environ['SENDER_EMAIL']
+              user_email = get_user_email(username)
+              admin_email = os.environ['ADMIN_EMAIL']
+              
+              subject = f'AWS IAM Key Rotation Notification - {key_status}'
+              
+              # Prepare email body based on the status
+              if key_status == 'New Key Created':
+                  body = f"""
+                  Hello,
+                  
+                  A new AWS IAM access key has been created for your account.
+                  
+                  User: {username}
+                  Status: {key_status}
+                  Time: {datetime.datetime.now().isoformat()}
+                  
+                  The new key has been stored in AWS Secrets Manager.
+                  Secret Name: iam-key-{username}
+                  
+                  Please update your applications with the new key.
+                  
+                  Best regards,
+                  AWS IAM Key Rotation System
+                  """
+              elif key_status == 'Key Deactivated':
+                  body = f"""
+                  Hello,
+                  
+                  Your AWS IAM access key has been deactivated.
+                  
+                  User: {username}
+                  Status: {key_status}
+                  Time: {datetime.datetime.now().isoformat()}
+                  
+                  The key will be deleted in {os.environ['RECOVERY_GRACE_PERIOD']} hours.
+                  Please ensure you have updated all applications with the new key.
+                  
+                  Best regards,
+                  AWS IAM Key Rotation System
+                  """
+              elif key_status == 'Key Deleted':
+                  body = f"""
+                  Hello,
+                  
+                  Your AWS IAM access key has been deleted.
+                  
+                  User: {username}
+                  Status: {key_status}
+                  Time: {datetime.datetime.now().isoformat()}
+                  
+                  Please ensure you have updated all applications with the new key.
+                  
+                  Best regards,
+                  AWS IAM Key Rotation System
+                  """
+              
+              try:
+                  response = ses.send_email(
+                      Source=sender,
+                      Destination={
+                          'ToAddresses': [user_email, admin_email]
+                      },
+                      Message={
+                          'Subject': {
+                              'Data': subject
+                          },
+                          'Body': {
+                              'Text': {
+                                  'Data': body
+                              }
+                          }
+                      }
+                  )
+                  print(f"Email sent successfully: {response['MessageId']}")
+                  put_metric(username, 'EmailSent')
+              except Exception as e:
+                  print(f"Error sending email: {str(e)}")
+                  put_metric(username, 'EmailFailed')
+          
+          def lambda_handler(event, context):
+              iam = boto3.client('iam')
+              secretsmanager = boto3.client('secretsmanager')
+              
+              # Get all IAM users
+              users = iam.list_users()['Users']
+              
+              for user in users:
+                  username = user['UserName']
+                  if not username.startswith('test-user-'):
+                      continue
+                      
+                  # Get user's access keys
+                  keys = iam.list_access_keys(UserName=username)['AccessKeyMetadata']
+                  
+                  # Sort keys by creation date (oldest first)
+                  keys.sort(key=lambda x: x['CreateDate'])
+                  
+                  # Check if we need to rotate keys
+                  for key in keys:
+                      key_age = (datetime.datetime.now(datetime.timezone.utc) - key['CreateDate']).total_seconds() / 3600
+                      
+                      if key_age >= float(os.environ['ROTATION_PERIOD']):  # 30-minute rotation period
+                          # If user has 2 active keys, deactivate the oldest one first
+                          active_keys = [k for k in keys if k['Status'] == 'Active']
+                          if len(active_keys) >= 2:
+                              oldest_key = active_keys[0]
+                              iam.update_access_key(
+                                  UserName=username,
+                                  AccessKeyId=oldest_key['AccessKeyId'],
+                                  Status='Inactive'
+                              )
+                              put_metric(username, 'KeyDeactivated')
+                              send_notification_email(
+                                  username,
+                                  'Key Deactivated',
+                                  old_key=oldest_key
+                              )
+                          
+                          # Create new key
+                          new_key = iam.create_access_key(UserName=username)
+                          put_metric(username, 'NewKeyCreated')
+                          
+                          # Store new key in Secrets Manager
+                          secret_name = f'iam-key-{username}'
+                          secret_value = {
+                              'AccessKeyId': new_key['AccessKey']['AccessKeyId'],
+                              'SecretAccessKey': new_key['AccessKey']['SecretAccessKey'],
+                              'CreatedDate': datetime.datetime.now().isoformat()
+                          }
+                          
+                          try:
+                              secretsmanager.put_secret_value(
+                                  SecretId=secret_name,
+                                  SecretString=json.dumps(secret_value)
+                              )
+                              put_metric(username, 'SecretUpdated')
+                          except:
+                              secretsmanager.create_secret(
+                                  Name=secret_name,
+                                  SecretString=json.dumps(secret_value)
+                              )
+                              put_metric(username, 'SecretCreated')
+                          
+                          # Send notification for new key
+                          send_notification_email(
+                              username,
+                              'New Key Created',
+                              new_key=new_key
+                          )
+                          
+                          # Delete old key after 1.5 hours
+                          if key_age >= (float(os.environ['INACTIVE_PERIOD']) + float(os.environ['RECOVERY_GRACE_PERIOD'])):
+                              iam.delete_access_key(
+                                  UserName=username,
+                                  AccessKeyId=key['AccessKeyId']
+                              )
+                              put_metric(username, 'KeyDeleted')
+                              send_notification_email(
+                                  username,
+                                  'Key Deleted',
+                                  old_key=key
+                              )
+      
+      Runtime: python3.9
+      Timeout: 300
+      Environment:
+        Variables:
+          ROTATION_PERIOD: '0.5'  # 30 minutes in hours
+          INACTIVE_PERIOD: '0.167'  # 10 minutes in hours
+          INACTIVE_BUFFER: !Ref InactiveBuffer
+          RECOVERY_GRACE_PERIOD: '0.083'  # 5 minutes in hours
+          SENDER_EMAIL: !Ref SenderEmail
+          ADMIN_EMAIL: !Ref AdminEmail
+
+  KeyRotationSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Schedule for IAM key rotation'
+      ScheduleExpression: 'rate(15 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt KeyRotationLambda.Arn
+          Id: 'KeyRotationLambda'
+
+  KeyRotationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref KeyRotationLambda
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt KeyRotationSchedule.Arn
+
+  KeyRotationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: 'IAMKeyRotationDashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["IAMKeyRotation", "KeyRotationStatus", "Status", "NewKeyCreated"],
+                  ["IAMKeyRotation", "KeyRotationStatus", "Status", "KeyDeactivated"],
+                  ["IAMKeyRotation", "KeyRotationStatus", "Status", "KeyDeleted"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Key Rotation Status",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["IAMKeyRotation", "KeyRotationStatus", "Status", "EmailSent"],
+                  ["IAMKeyRotation", "KeyRotationStatus", "Status", "EmailFailed"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Email Notifications",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+Outputs:
+  KeyRotationLambdaArn:
+    Description: 'ARN of the Key Rotation Lambda function'
+    Value: !GetAtt KeyRotationLambda.Arn
+  
+  DashboardUrl:
+    Description: 'URL of the CloudWatch Dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=IAMKeyRotationDashboard' 

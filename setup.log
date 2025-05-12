@@ -1,0 +1,17 @@
+2025-05-08 14:30:51,071 - INFO - Starting AWS resource setup
+2025-05-08 14:30:51,099 - INFO - Found credentials in shared credentials file: ~/.aws/credentials
+2025-05-08 14:30:52,536 - ERROR - Error creating user test-user-1: An error occurred (EntityAlreadyExists) when calling the CreateUser operation: User with name test-user-1 already exists.
+2025-05-08 14:30:52,821 - ERROR - Error creating user test-user-2: An error occurred (EntityAlreadyExists) when calling the CreateUser operation: User with name test-user-2 already exists.
+2025-05-08 14:30:53,102 - ERROR - Error creating user test-user-3: An error occurred (EntityAlreadyExists) when calling the CreateUser operation: User with name test-user-3 already exists.
+2025-05-08 14:30:53,383 - ERROR - Error creating user test-user-4: An error occurred (EntityAlreadyExists) when calling the CreateUser operation: User with name test-user-4 already exists.
+2025-05-08 14:30:53,668 - ERROR - Error creating user test-user-5: An error occurred (EntityAlreadyExists) when calling the CreateUser operation: User with name test-user-5 already exists.
+2025-05-08 14:30:53,950 - ERROR - Error creating user test-user-6: An error occurred (EntityAlreadyExists) when calling the CreateUser operation: User with name test-user-6 already exists.
+2025-05-08 14:30:54,238 - ERROR - Error creating user test-user-7: An error occurred (EntityAlreadyExists) when calling the CreateUser operation: User with name test-user-7 already exists.
+2025-05-08 14:30:54,518 - ERROR - Error creating user test-user-8: An error occurred (EntityAlreadyExists) when calling the CreateUser operation: User with name test-user-8 already exists.
+2025-05-08 14:30:54,805 - ERROR - Error creating user test-user-9: An error occurred (EntityAlreadyExists) when calling the CreateUser operation: User with name test-user-9 already exists.
+2025-05-08 14:30:55,088 - ERROR - Error creating user test-user-10: An error occurred (EntityAlreadyExists) when calling the CreateUser operation: User with name test-user-10 already exists.
+2025-05-08 14:30:55,088 - INFO - Created 0 IAM users
+2025-05-08 14:30:55,088 - INFO - Created 0 access keys
+2025-05-08 14:30:55,088 - INFO - Stored all keys in Secrets Manager
+2025-05-08 14:30:56,851 - ERROR - Error creating S3 bucket key-rotation-templates-1746682201: An error occurred (IllegalLocationConstraintException) when calling the CreateBucket operation: The us-east-1 location constraint is incompatible for the region specific endpoint this request was sent to.
+2025-05-08 14:30:56,852 - INFO - AWS resource setup completed successfully
