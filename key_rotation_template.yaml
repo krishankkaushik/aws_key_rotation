@@ -63,6 +63,7 @@ Resources:
                   - secretsmanager:GetSecretValue
                   - secretsmanager:PutSecretValue
                   - secretsmanager:DescribeSecret
+                  - secretsmanager:CreateSecret
                 Resource: '*'
               - Effect: Allow
                 Action:
@@ -85,23 +86,33 @@ Resources:
           import json
           import datetime
           import os
+          import logging
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
           
           def put_metric(user, status):
-              cloudwatch = boto3.client('cloudwatch')
-              cloudwatch.put_metric_data(
-                  Namespace='IAMKeyRotation',
-                  MetricData=[
-                      {
-                          'MetricName': 'KeyRotationStatus',
-                          'Value': 1,
-                          'Unit': 'Count',
-                          'Dimensions': [
-                              {'Name': 'User', 'Value': user},
-                              {'Name': 'Status', 'Value': status}
-                          ]
-                      }
-                  ]
-              )
+              """Send metrics to CloudWatch"""
+              try:
+                  cloudwatch = boto3.client('cloudwatch')
+                  cloudwatch.put_metric_data(
+                      Namespace='IAMKeyRotation',
+                      MetricData=[
+                          {
+                              'MetricName': 'KeyRotationStatus',
+                              'Value': 1,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {'Name': 'User', 'Value': user},
+                                  {'Name': 'Status', 'Value': status}
+                              ]
+                          }
+                      ]
+                  )
+                  logger.info(f"Metric sent: {status} for user {user}")
+              except Exception as e:
+                  logger.error(f"Error sending metric: {str(e)}")
           
           def get_user_email(username):
               """Get user's email from IAM tags or return admin email"""
@@ -118,72 +129,72 @@ Resources:
                   if 'Email' in user['User']:
                       return user['User']['Email']
               except Exception as e:
-                  print(f"Error getting email for {username}: {str(e)}")
+                  logger.error(f"Error getting email for {username}: {str(e)}")
               
               # Return admin email as fallback
               return os.environ['ADMIN_EMAIL']
           
           def send_notification_email(username, key_status, new_key=None, old_key=None):
               """Send notification email with detailed information"""
-              ses = boto3.client('ses')
-              sender = os.environ['SENDER_EMAIL']
-              user_email = get_user_email(username)
-              admin_email = os.environ['ADMIN_EMAIL']
-              
-              subject = f'AWS IAM Key Rotation Notification - {key_status}'
-              
-              # Prepare email body based on the status
-              if key_status == 'New Key Created':
-                  body = f"""
-                  Hello,
-                  
-                  A new AWS IAM access key has been created for your account.
-                  
-                  User: {username}
-                  Status: {key_status}
-                  Time: {datetime.datetime.now().isoformat()}
-                  
-                  The new key has been stored in AWS Secrets Manager.
-                  Secret Name: iam-key-{username}
-                  
-                  Please update your applications with the new key.
-                  
-                  Best regards,
-                  AWS IAM Key Rotation System
-                  """
-              elif key_status == 'Key Deactivated':
-                  body = f"""
-                  Hello,
-                  
-                  Your AWS IAM access key has been deactivated.
-                  
-                  User: {username}
-                  Status: {key_status}
-                  Time: {datetime.datetime.now().isoformat()}
-                  
-                  The key will be deleted in {os.environ['RECOVERY_GRACE_PERIOD']} hours.
-                  Please ensure you have updated all applications with the new key.
-                  
-                  Best regards,
-                  AWS IAM Key Rotation System
-                  """
-              elif key_status == 'Key Deleted':
-                  body = f"""
-                  Hello,
-                  
-                  Your AWS IAM access key has been deleted.
-                  
-                  User: {username}
-                  Status: {key_status}
-                  Time: {datetime.datetime.now().isoformat()}
-                  
-                  Please ensure you have updated all applications with the new key.
-                  
-                  Best regards,
-                  AWS IAM Key Rotation System
-                  """
-              
               try:
+                  ses = boto3.client('ses')
+                  sender = os.environ['SENDER_EMAIL']
+                  user_email = get_user_email(username)
+                  admin_email = os.environ['ADMIN_EMAIL']
+                  
+                  subject = f'AWS IAM Key Rotation Notification - {key_status}'
+                  
+                  # Prepare email body based on the status
+                  if key_status == 'New Key Created':
+                      body = f"""
+                      Hello,
+                      
+                      A new AWS IAM access key has been created for your account.
+                      
+                      User: {username}
+                      Status: {key_status}
+                      Time: {datetime.datetime.now().isoformat()}
+                      
+                      The new key has been stored in AWS Secrets Manager.
+                      Secret Name: {username}
+                      
+                      Please update your applications with the new key.
+                      
+                      Best regards,
+                      AWS IAM Key Rotation System
+                      """
+                  elif key_status == 'Key Deactivated':
+                      body = f"""
+                      Hello,
+                      
+                      Your AWS IAM access key has been deactivated.
+                      
+                      User: {username}
+                      Status: {key_status}
+                      Time: {datetime.datetime.now().isoformat()}
+                      
+                      The key will be deleted in {os.environ['RECOVERY_GRACE_PERIOD']} hours.
+                      Please ensure you have updated all applications with the new key.
+                      
+                      Best regards,
+                      AWS IAM Key Rotation System
+                      """
+                  elif key_status == 'Key Deleted':
+                      body = f"""
+                      Hello,
+                      
+                      Your AWS IAM access key has been deleted.
+                      
+                      User: {username}
+                      Status: {key_status}
+                      Time: {datetime.datetime.now().isoformat()}
+                      
+                      Please ensure you have updated all applications with the new key.
+                      
+                      Best regards,
+                      AWS IAM Key Rotation System
+                      """
+                  
                   response = ses.send_email(
                       Source=sender,
                       Destination={
@@ -200,26 +211,48 @@ Resources:
                           }
                       }
                   )
-                  print(f"Email sent successfully: {response['MessageId']}")
+                  logger.info(f"Email sent successfully: {response['MessageId']}")
                   put_metric(username, 'EmailSent')
               except Exception as e:
-                  print(f"Error sending email: {str(e)}")
+                  logger.error(f"Error sending email: {str(e)}")
                   put_metric(username, 'EmailFailed')
           
-          def lambda_handler(event, context):
-              iam = boto3.client('iam')
-              secretsmanager = boto3.client('secretsmanager')
-              
-              # Get all IAM users
-              users = iam.list_users()['Users']
-              
-              for user in users:
-                  username = user['UserName']
-                  if not username.startswith('test-user-'):
-                      continue
-                      
+          def store_key_in_secrets_manager(secretsmanager_client, username, key):
+              """Store access key in Secrets Manager"""
+              try:
+                  secret_name = username  # Using username directly as secret name
+                  secret_value = {
+                      'AccessKeyId': key['AccessKeyId'],
+                      'SecretAccessKey': key['SecretAccessKey'],
+                      'CreatedDate': datetime.datetime.now().isoformat()
+                  }
+                  
+                  # Check if secret exists
+                  try:
+                      secretsmanager_client.describe_secret(SecretId=secret_name)
+                      # Update existing secret
+                      secretsmanager_client.update_secret(
+                          SecretId=secret_name,
+                          SecretString=json.dumps(secret_value)
+                      )
+                      logger.info(f"Updated credentials in Secrets Manager for: {username}")
+                  except secretsmanager_client.exceptions.ResourceNotFoundException:
+                      # Create new secret
+                      secretsmanager_client.create_secret(
+                          Name=secret_name,
+                          SecretString=json.dumps(secret_value),
+                          Description=f'AWS credentials for {username}'
+                      )
+                      logger.info(f"Stored credentials in Secrets Manager for: {username}")
+              except Exception as e:
+                  logger.error(f"Error storing credentials for {username}: {str(e)}")
+                  raise
+          
+          def rotate_keys_for_user(iam_client, secretsmanager_client, username):
+              """Rotate keys for a specific user"""
+              try:
                   # Get user's access keys
-                  keys = iam.list_access_keys(UserName=username)['AccessKeyMetadata']
+                  keys = iam_client.list_access_keys(UserName=username)['AccessKeyMetadata']
                   
                   # Sort keys by creation date (oldest first)
                   keys.sort(key=lambda x: x['CreateDate'])
@@ -233,11 +266,12 @@ Resources:
                           active_keys = [k for k in keys if k['Status'] == 'Active']
                           if len(active_keys) >= 2:
                               oldest_key = active_keys[0]
-                              iam.update_access_key(
+                              iam_client.update_access_key(
                                   UserName=username,
                                   AccessKeyId=oldest_key['AccessKeyId'],
                                   Status='Inactive'
                               )
+                              logger.info(f"Deactivated key {oldest_key['AccessKeyId']} for user {username}")
                               put_metric(username, 'KeyDeactivated')
                               send_notification_email(
                                   username,
@@ -246,78 +280,94 @@ Resources:
                               )
                           
                           # Create new key
-                          new_key = iam.create_access_key(UserName=username)
+                          new_key = iam_client.create_access_key(UserName=username)
+                          logger.info(f"Created new key for user {username}")
                           put_metric(username, 'NewKeyCreated')
-                          
-                          # Store new key in Secrets Manager
-                          secret_name = f'iam-key-{username}'
-                          secret_value = {
-                              'AccessKeyId': new_key['AccessKey']['AccessKeyId'],
-                              'SecretAccessKey': new_key['AccessKey']['SecretAccessKey'],
-                              'CreatedDate': datetime.datetime.now().isoformat()
-                          }
-                          
-                          try:
-                              secretsmanager.put_secret_value(
-                                  SecretId=secret_name,
-                                  SecretString=json.dumps(secret_value)
-                              )
-                              put_metric(username, 'SecretUpdated')
-                          except:
-                              secretsmanager.create_secret(
-                                  Name=secret_name,
-                                  SecretString=json.dumps(secret_value)
-                              )
-                              put_metric(username, 'SecretCreated')
-                          
-                          # Send notification for new key
                           send_notification_email(
                               username,
                               'New Key Created',
                               new_key=new_key
                           )
                           
-                          # Delete old key after 1.5 hours
-                          if key_age >= (float(os.environ['INACTIVE_PERIOD']) + float(os.environ['RECOVERY_GRACE_PERIOD'])):
-                              iam.delete_access_key(
-                                  UserName=username,
-                                  AccessKeyId=key['AccessKeyId']
-                              )
-                              put_metric(username, 'KeyDeleted')
-                              send_notification_email(
-                                  username,
-                                  'Key Deleted',
-                                  old_key=key
-                              )
-      
+                          # Store new key in Secrets Manager
+                          store_key_in_secrets_manager(secretsmanager_client, username, new_key)
+                          
+                          # If there are inactive keys older than the recovery grace period, delete them
+                          inactive_keys = [k for k in keys if k['Status'] == 'Inactive']
+                          for inactive_key in inactive_keys:
+                              inactive_age = (datetime.datetime.now(datetime.timezone.utc) - inactive_key['CreateDate']).total_seconds() / 3600
+                              if inactive_age >= float(os.environ['RECOVERY_GRACE_PERIOD']):
+                                  iam_client.delete_access_key(
+                                      UserName=username,
+                                      AccessKeyId=inactive_key['AccessKeyId']
+                                  )
+                                  logger.info(f"Deleted key {inactive_key['AccessKeyId']} for user {username}")
+                                  put_metric(username, 'KeyDeleted')
+                                  send_notification_email(
+                                      username,
+                                      'Key Deleted',
+                                      old_key=inactive_key
+                                  )
+              except Exception as e:
+                  logger.error(f"Error rotating keys for user {username}: {str(e)}")
+                  raise
+          
+          def lambda_handler(event, context):
+              """Main Lambda handler"""
+              try:
+                  iam = boto3.client('iam')
+                  secretsmanager = boto3.client('secretsmanager')
+                  
+                  # Get all IAM users
+                  users = iam.list_users()['Users']
+                  logger.info(f"Found {len(users)} IAM users")
+                  
+                  for user in users:
+                      username = user['UserName']
+                      if not username.startswith('test-user-'):
+                          continue
+                      
+                      logger.info(f"Processing user: {username}")
+                      rotate_keys_for_user(iam, secretsmanager, username)
+                      
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Key rotation completed successfully')
+                  }
+              except Exception as e:
+                  logger.error(f"Error in Lambda handler: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
       Runtime: python3.9
       Timeout: 300
       Environment:
         Variables:
-          ROTATION_PERIOD: '0.5'  # 30 minutes in hours
-          INACTIVE_PERIOD: '0.167'  # 10 minutes in hours
+          ROTATION_PERIOD: !Ref RotationPeriod
+          INACTIVE_PERIOD: !Ref InactivePeriod
           INACTIVE_BUFFER: !Ref InactiveBuffer
-          RECOVERY_GRACE_PERIOD: '0.083'  # 5 minutes in hours
-          SENDER_EMAIL: !Ref SenderEmail
+          RECOVERY_GRACE_PERIOD: !Ref RecoveryGracePeriod
           ADMIN_EMAIL: !Ref AdminEmail
+          SENDER_EMAIL: !Ref SenderEmail
 
-  KeyRotationSchedule:
+  KeyRotationEventRule:
     Type: AWS::Events::Rule
     Properties:
-      Description: 'Schedule for IAM key rotation'
-      ScheduleExpression: 'rate(15 minutes)'
+      Description: 'Trigger key rotation every 5 minutes'
+      ScheduleExpression: 'rate(5 minutes)'
       State: ENABLED
       Targets:
         - Arn: !GetAtt KeyRotationLambda.Arn
           Id: 'KeyRotationLambda'
 
-  KeyRotationPermission:
+  KeyRotationLambdaPermission:
     Type: AWS::Lambda::Permission
     Properties:
       Action: 'lambda:InvokeFunction'
       FunctionName: !Ref KeyRotationLambda
-      Principal: 'events.amazonaws.com'
-      SourceArn: !GetAtt KeyRotationSchedule.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt KeyRotationEventRule.Arn
 
   KeyRotationDashboard:
     Type: AWS::CloudWatch::Dashboard
