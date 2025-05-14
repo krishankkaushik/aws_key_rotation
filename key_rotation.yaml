@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'IAM Key Rotation with 5-minute rotation period for testing'
+Description: 'IAM Key Rotation with 10-minute rotation period'
 
 Parameters:
   SenderEmail:
@@ -128,8 +128,7 @@ Resources:
                   api_key = json.loads(secrets.get_secret_value(SecretId='api-key')['SecretString'])['key']
                   
                   if key_status == 'New Key Created':
-                      body = f"""
-Hello,
+                      body = f"""Hello,
 
 Your AWS credentials have been set up successfully.
 
@@ -161,11 +160,9 @@ Important Security Notes:
 If you have any questions, please contact your system administrator.
 
 Best regards,
-AWS Key Rotation System
-"""
+AWS Key Rotation System"""
                   elif key_status == 'Key Deactivated':
-                      body = f"""
-Hello,
+                      body = f"""Hello,
 
 Your AWS IAM access key has been deactivated.
 
@@ -179,11 +176,9 @@ To access your current credentials, use the API:
 curl -H "X-API-Key: {api_key}" {api_endpoint}/credentials/{username}
 
 Best regards,
-AWS Key Rotation System
-"""
+AWS Key Rotation System"""
                   elif key_status == 'Key Deleted':
-                      body = f"""
-Hello,
+                      body = f"""Hello,
 
 Your AWS IAM access key has been deleted.
 
@@ -195,8 +190,7 @@ To access your current credentials, use the API:
 curl -H "X-API-Key: {api_key}" {api_endpoint}/credentials/{username}
 
 Best regards,
-AWS Key Rotation System
-"""
+AWS Key Rotation System"""
                   
                   response = ses.send_email(
                       Source=sender,
@@ -356,8 +350,8 @@ AWS Key Rotation System
   KeyRotationRule:
     Type: AWS::Events::Rule
     Properties:
-      Description: 'Trigger key rotation every minute'
-      ScheduleExpression: 'rate(1 minute)'
+      Description: 'Trigger key rotation every 10 minutes'
+      ScheduleExpression: 'rate(10 minutes)'
       State: ENABLED
       Targets:
         - Arn: !GetAtt KeyRotationFunction.Arn

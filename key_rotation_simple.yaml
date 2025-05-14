@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IAM Key Rotation with 10-minute rotation period'
+
+Parameters:
+  SenderEmail:
+    Type: String
+    Description: 'Sender email address for notifications'
+  
+  AdminEmail:
+    Type: String
+    Description: 'Admin email address for notifications'
+
+Resources:
+  KeyRotationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KeyRotationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:CreateAccessKey
+                  - iam:DeleteAccessKey
+                  - iam:ListAccessKeys
+                  - iam:UpdateAccessKey
+                  - iam:GetUser
+                  - iam:ListUserTags
+                  - iam:ListUsers
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:CreateSecret
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+
+  KeyRotationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt KeyRotationRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Environment:
+        Variables:
+          SENDER_EMAIL: !Ref SenderEmail
+          ADMIN_EMAIL: !Ref AdminEmail
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import datetime
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """Lambda handler for key rotation"""
+              try:
+                  logger.info("Lambda function started")
+                  logger.info(f"Event: {json.dumps(event)}")
+                  
+                  # Initialize AWS clients
+                  iam = boto3.client('iam')
+                  
+                  # List all IAM users
+                  response = iam.list_users()
+                  users = response['Users']
+                  logger.info(f"Found {len(users)} IAM users")
+                  
+                  for user in users:
+                      username = user['UserName']
+                      logger.info(f"Processing user: {username}")
+                      
+                      # Skip AWS service accounts
+                      if username.startswith('AWS-'):
+                          logger.info(f"Skipping AWS service account: {username}")
+                          continue
+                      
+                      # List access keys
+                      keys = iam.list_access_keys(UserName=username)
+                      logger.info(f"Found {len(keys['AccessKeyMetadata'])} keys for {username}")
+                      
+                      # Create new key
+                      new_key = iam.create_access_key(UserName=username)
+                      logger.info(f"Created new key for {username}")
+                      
+                      # Deactivate old keys
+                      for key in keys['AccessKeyMetadata']:
+                          if key['Status'] == 'Active':
+                              iam.update_access_key(
+                                  UserName=username,
+                                  AccessKeyId=key['AccessKeyId'],
+                                  Status='Inactive'
+                              )
+                              logger.info(f"Deactivated old key {key['AccessKeyId']} for {username}")
+                              
+                              # Delete old key
+                              iam.delete_access_key(
+                                  UserName=username,
+                                  AccessKeyId=key['AccessKeyId']
+                              )
+                              logger.info(f"Deleted old key {key['AccessKeyId']} for {username}")
+                  
+                  logger.info("Key rotation completed successfully")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Key rotation completed')
+                  }
+              except Exception as e:
+                  logger.error(f"Error in lambda handler: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+
+  KeyRotationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: KeyRotationRule
+      Description: 'Trigger key rotation every 10 minutes'
+      ScheduleExpression: 'rate(10 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt KeyRotationFunction.Arn
+          Id: KeyRotationFunction
+
+  KeyRotationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref KeyRotationFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt KeyRotationRule.Arn
+
+  InitialRotationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: InitialRotationRule
+      Description: 'Trigger initial key rotation'
+      EventPattern:
+        source:
+          - aws.cloudformation
+        detail-type:
+          - AWS CloudFormation Stack Status Change
+        detail:
+          stack-name:
+            - !Ref AWS::StackName
+          status-details:
+            status:
+              - CREATE_COMPLETE
+              - UPDATE_COMPLETE
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt KeyRotationFunction.Arn
+          Id: InitialRotationFunction
+
+  InitialRotationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref KeyRotationFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InitialRotationRule.Arn
+
+Outputs:
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt KeyRotationFunction.Arn
+    Export:
+      Name: KeyRotationLambdaArn
+
+  EventRuleArn:
+    Description: 'ARN of the EventBridge rule'
+    Value: !GetAtt KeyRotationRule.Arn
+    Export:
+      Name: KeyRotationEventRuleArn 
