@@ -1,430 +1,432 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'AWS Key Rotation System'
+Description: 'IAM Key Rotation Solution with API Gateway Integration'
 
 Parameters:
-  RotationInterval:
-    Type: Number
-    Default: 10
-    Description: 'Interval in minutes for key rotation'
-  
-  DeactivationInterval:
-    Type: Number
-    Default: 12
-    Description: 'Interval in minutes for key deactivation'
-  
-  DeletionInterval:
-    Type: Number
-    Default: 15
-    Description: 'Interval in minutes for key deletion'
-  
   SenderEmail:
     Type: String
-    Description: 'Email address for sending notifications'
+    Description: 'Email address to send notifications from'
+  RotationPeriod:
+    Type: Number
+    Default: 10
+    Description: 'Time in minutes between key rotations'
+  InactivePeriod:
+    Type: Number
+    Default: 12
+    Description: 'Time in minutes before deactivating old keys'
+  DeletionPeriod:
+    Type: Number
+    Default: 15
+    Description: 'Time in minutes before deleting old keys'
 
 Resources:
   KeyRotationFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: iam-key-rotation-KeyRotationFunction-tSqkEMN96R3N
       Handler: index.handler
       Role: !GetAtt KeyRotationRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Environment:
+        Variables:
+          SENDER_EMAIL: !Ref SenderEmail
+          ROTATION_PERIOD: !Ref RotationPeriod
+          INACTIVE_PERIOD: !Ref InactivePeriod
+          DELETION_PERIOD: !Ref DeletionPeriod
       Code:
         ZipFile: |
           import json
           import boto3
-          import time
-          from datetime import datetime, timedelta
           import os
           import logging
+          from datetime import datetime, timezone
           
-          # Configure logging
+          # Set up logging
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
           
-          def mask_secret(secret):
-              """Mask a secret string, showing only first 4 and last 4 characters."""
-              if len(secret) <= 8:
-                  return '*' * len(secret)
-              return secret[:4] + '*' * (len(secret) - 8) + secret[-4:]
+          # Initialize AWS clients
+          iam = boto3.client('iam')
+          ses = boto3.client('ses')
+          secrets = boto3.client('secretsmanager')
+          
+          def send_email(to_email, subject, body):
+              try:
+                  # Get API details from Secrets Manager
+                  api_key_secret = json.loads(secrets.get_secret_value(SecretId='key-rotation-api-key')['SecretString'])
+                  api_key = api_key_secret['api_key']
+                  
+                  # Get API endpoint from CloudFormation stack
+                  cf = boto3.client('cloudformation')
+                  stack = cf.describe_stacks(StackName='iam-key-rotation')
+                  api_endpoint = None
+                  for output in stack['Stacks'][0]['Outputs']:
+                      if output['OutputKey'] == 'ApiEndpoint':
+                          api_endpoint = output['OutputValue']
+                          break
+                  
+                  if subject == 'AWS IAM Access Key Created':
+                      body = f"""Hello,
+
+Your AWS credentials have been set up successfully.
+
+You can use these credentials to access AWS services. The credentials are also stored in AWS Secrets Manager.
+
+To access your credentials programmatically, you can use the following API endpoint:
+{api_endpoint}
+
+Your API Key: {api_key}
+
+Example API calls:
+
+1. Get your credentials:
+curl -H "X-API-Key: {api_key}" {api_endpoint}/credentials/{body.split(': ')[-1]}
+
+2. Create new credentials (if needed):
+curl -X POST -H "X-API-Key: {api_key}" {api_endpoint}/credentials/{body.split(': ')[-1]}
+
+3. Export all credentials:
+curl -X POST -H "X-API-Key: {api_key}" {api_endpoint}/export-credentials
+
+Important Security Notes:
+1. Keep these credentials secure and never share them
+2. The system will automatically rotate your keys every 10 minutes
+3. You will receive email notifications for key rotation events
+4. Old keys will be automatically deactivated after 12 minutes
+5. Deactivated keys will be deleted after 15 minutes
+
+If you have any questions, please contact your system administrator.
+
+Best regards,
+AWS Key Rotation System"""
+                  elif subject == 'AWS IAM Access Key Rotation':
+                      body = f"""Hello,
+
+Your IAM access key has been rotated.
+
+New key: {body.split(': ')[-1]}
+
+You can access your new credentials using the API endpoint:
+{api_endpoint}
+
+Your API Key: {api_key}
+
+Example API calls:
+
+1. Get your credentials:
+curl -H "X-API-Key: {api_key}" {api_endpoint}/credentials/{body.split(': ')[-1]}
+
+2. Create new credentials (if needed):
+curl -X POST -H "X-API-Key: {api_key}" {api_endpoint}/credentials/{body.split(': ')[-1]}
+
+3. Export all credentials:
+curl -X POST -H "X-API-Key: {api_key}" {api_endpoint}/export-credentials
+
+Important Security Notes:
+1. Keep these credentials secure and never share them
+2. The system will automatically rotate your keys every 10 minutes
+3. You will receive email notifications for key rotation events
+4. Old keys will be automatically deactivated after 12 minutes
+5. Deactivated keys will be deleted after 15 minutes
+
+If you have any questions, please contact your system administrator.
+
+Best regards,
+AWS Key Rotation System"""
+                  elif subject == 'AWS IAM Access Key Deactivated':
+                      body = f"""Hello,
+
+Your old IAM access key has been deactivated.
+
+Key ID: {body.split(': ')[-1]}
+
+Important Security Notes:
+1. The deactivated key will be deleted in 3 minutes
+2. Please ensure you are using your new active key
+
+Best regards,
+AWS Key Rotation System"""
+                  elif subject == 'AWS IAM Access Key Deleted':
+                      body = f"""Hello,
+
+Your old IAM access key has been deleted.
+
+Important Security Notes:
+1. Please ensure you are using your new active key
+2. If you need to create new credentials, use the API endpoint:
+{api_endpoint}
+
+Your API Key: {api_key}
+
+Best regards,
+AWS Key Rotation System"""
+
+                  response = ses.send_email(
+                      Source=os.environ['SENDER_EMAIL'],
+                      Destination={'ToAddresses': [to_email]},
+                      Message={
+                          'Subject': {'Data': subject},
+                          'Body': {'Text': {'Data': body}}
+                      }
+                  )
+                  logger.info(f"Email sent successfully: {response['MessageId']}")
+              except Exception as e:
+                  logger.error(f"Failed to send email: {str(e)}")
+          
+          def get_user_email(username):
+              try:
+                  response = iam.get_user(UserName=username)
+                  return response['User'].get('Email', os.environ['SENDER_EMAIL'])
+              except Exception as e:
+                  logger.error(f"Failed to get user email: {str(e)}")
+                  return os.environ['SENDER_EMAIL']
           
           def handler(event, context):
-              logger.info(f"Received event: {json.dumps(event)}")
-              
-              iam = boto3.client('iam')
-              secrets = boto3.client('secretsmanager')
-              ses = boto3.client('ses')
-              
-              # Check if this is an API Gateway event
-              if 'path' in event:
-                  return handle_api_request(event, context)
-              
-              # This is a scheduled event
               try:
-                  # Parse the event input
-                  if isinstance(event.get('detail', {}).get('input'), str):
-                      event_input = json.loads(event['detail']['input'])
-                  elif isinstance(event.get('input'), str):
-                      event_input = json.loads(event['input'])
-                  else:
-                      event_input = event.get('input', {})
+                  # Check if this is an API Gateway event
+                  if 'httpMethod' in event:
+                      return handle_api_request(event)
                   
-                  action = event_input.get('action', 'rotate')
-                  logger.info(f"Processing scheduled action: {action}")
-                  
-                  # Get all secrets
-                  secrets_list = secrets.list_secrets()
-                  logger.info(f"Found {len(secrets_list['SecretList'])} secrets")
-                  
-                  for secret in secrets_list['SecretList']:
-                      if not secret['Name'].startswith('test-user-'):
-                          continue
-                          
-                      try:
-                          # Get secret value
-                          secret_value = json.loads(secrets.get_secret_value(SecretId=secret['Name'])['SecretString'])
-                          created_date = datetime.strptime(secret_value['CreatedDate'], '%Y-%m-%dT%H:%M:%SZ')
-                          current_time = datetime.utcnow()
-                          
-                          logger.info(f"Processing secret {secret['Name']} with created_date {created_date}")
-                          
-                          if action == 'rotate':
-                              # Check if rotation is needed (every 10 minutes)
-                              time_diff = (current_time - created_date).total_seconds() / 60
-                              logger.info(f"Time since last rotation: {time_diff} minutes")
-                              
-                              if time_diff >= 10:
-                                  username = secret['Name']
-                                  email = secret_value['Email']
-                                  
-                                  logger.info(f"Creating new access key for {username}")
-                                  
-                                  # Create new access key
-                                  new_key = iam.create_access_key(UserName=username)
-                                  
-                                  # Store new credentials
-                                  new_secret_value = {
-                                      'AccessKeyId': new_key['AccessKey']['AccessKeyId'],
-                                      'SecretAccessKey': new_key['AccessKey']['SecretAccessKey'],
-                                      'CreatedDate': current_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
-                                      'Email': email,
-                                      'OldAccessKeyId': secret_value['AccessKeyId']  # Store old key for deactivation
-                                  }
-                                  
-                                  secrets.update_secret(
-                                      SecretId=username,
-                                      SecretString=json.dumps(new_secret_value)
-                                  )
-                                  
-                                  logger.info(f"Updated secret for {username}")
-                                  
-                                  # Send email notification
-                                  if email:
-                                      ses.send_email(
-                                          Source='krishank.kaushik.1@gmail.com',
-                                          Destination={'ToAddresses': [email]},
-                                          Message={
-                                              'Subject': {'Data': f'AWS Credentials Rotated for {username}'},
-                                              'Body': {'Text': {'Data': f"""
-                                              Hello,
-                                              
-                                              Your AWS credentials have been rotated.
-                                              
-                                              New Access Key ID: {mask_secret(new_key['AccessKey']['AccessKeyId'])}
-                                              New Secret Access Key: {mask_secret(new_key['AccessKey']['SecretAccessKey'])}
-                                              
-                                              For security reasons, only a portion of your credentials is shown.
-                                              Please use the API endpoint to retrieve your full credentials when needed.
-                                              
-                                              The old key will be deactivated in 12 minutes and deleted in 15 minutes.
-                                              
-                                              Best regards,
-                                              AWS Key Rotation System
-                                              """}}
-                                          }
-                                      )
-                                      logger.info(f"Sent rotation notification to {email}")
-                          
-                          elif action == 'deactivate':
-                              # Deactivate old key if it exists
-                              if 'OldAccessKeyId' in secret_value:
-                                  try:
-                                      logger.info(f"Deactivating old key for {secret['Name']}")
-                                      iam.update_access_key(
-                                          UserName=secret['Name'],
-                                          AccessKeyId=secret_value['OldAccessKeyId'],
-                                          Status='Inactive'
-                                      )
-                                      logger.info(f"Deactivated old key for {secret['Name']}")
-                                      
-                                      # Send email notification
-                                      if secret_value['Email']:
-                                          ses.send_email(
-                                              Source='krishank.kaushik.1@gmail.com',
-                                              Destination={'ToAddresses': [secret_value['Email']]},
-                                              Message={
-                                                  'Subject': {'Data': f'AWS Credentials Deactivated for {secret["Name"]}'},
-                                                  'Body': {'Text': {'Data': f"""
-                                                  Hello,
-                                                  
-                                                  Your old AWS credentials have been deactivated.
-                                                  
-                                                  The deactivated key will be deleted in 3 minutes.
-                                                  
-                                                  Best regards,
-                                                  AWS Key Rotation System
-                                                  """}}
-                                              }
-                                          )
-                                          logger.info(f"Sent deactivation notification to {secret_value['Email']}")
-                                  except Exception as e:
-                                      logger.error(f"Error deactivating key for {secret['Name']}: {str(e)}")
-                          
-                          elif action == 'delete':
-                              # Delete old key if it exists
-                              if 'OldAccessKeyId' in secret_value:
-                                  try:
-                                      logger.info(f"Deleting old key for {secret['Name']}")
-                                      iam.delete_access_key(
-                                          UserName=secret['Name'],
-                                          AccessKeyId=secret_value['OldAccessKeyId']
-                                      )
-                                      logger.info(f"Deleted old key for {secret['Name']}")
-                                      
-                                      # Remove OldAccessKeyId from secret
-                                      secret_value.pop('OldAccessKeyId', None)
-                                      secrets.update_secret(
-                                          SecretId=secret['Name'],
-                                          SecretString=json.dumps(secret_value)
-                                      )
-                                      
-                                      # Send email notification
-                                      if secret_value['Email']:
-                                          ses.send_email(
-                                              Source='krishank.kaushik.1@gmail.com',
-                                              Destination={'ToAddresses': [secret_value['Email']]},
-                                              Message={
-                                                  'Subject': {'Data': f'AWS Credentials Deleted for {secret["Name"]}'},
-                                                  'Body': {'Text': {'Data': f"""
-                                                  Hello,
-                                                  
-                                                  Your old AWS credentials have been deleted.
-                                                  
-                                                  Best regards,
-                                                  AWS Key Rotation System
-                                                  """}}
-                                              }
-                                          )
-                                          logger.info(f"Sent deletion notification to {secret_value['Email']}")
-                                  except Exception as e:
-                                      logger.error(f"Error deleting key for {secret['Name']}: {str(e)}")
-                      except Exception as e:
-                          logger.error(f"Error processing secret {secret['Name']}: {str(e)}")
-                          continue
-                  
-                  return {
-                      'statusCode': 200,
-                      'body': json.dumps(f'Key {action} completed')
-                  }
+                  # This is a scheduled rotation event
+                  return handle_rotation_event()
               except Exception as e:
-                  logger.error(f"Error handling scheduled event: {str(e)}")
+                  logger.error(f"Error in handler: {str(e)}")
                   return {
                       'statusCode': 500,
-                      'body': json.dumps({'error': 'Internal server error'})
+                      'body': json.dumps({'error': str(e)})
                   }
           
-          def handle_api_request(event, context):
-              logger.info(f"Handling API request: {json.dumps(event)}")
-              
-              iam = boto3.client('iam')
-              secrets = boto3.client('secretsmanager')
-              ses = boto3.client('ses')
-              
-              # Add CORS headers
-              headers = {
-                  'Access-Control-Allow-Origin': '*',
-                  'Access-Control-Allow-Headers': 'Content-Type,X-API-Key',
-                  'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
-              }
-              
-              # Handle OPTIONS request for CORS
-              if event.get('httpMethod') == 'OPTIONS':
-                  return {
-                      'statusCode': 200,
-                      'headers': headers,
-                      'body': ''
-                  }
-              
+          def handle_api_request(event):
               try:
-                  # Validate API key
-                  api_key = event.get('headers', {}).get('x-api-key')
-                  if not api_key:
-                      return {
-                          'statusCode': 401,
-                          'headers': headers,
-                          'body': json.dumps({'error': 'API key is required'})
-                      }
-                  
-                  # Get stored API key from Secrets Manager
-                  try:
-                      stored_api_key = json.loads(secrets.get_secret_value(SecretId='key-rotation-api-key')['SecretString'])['api_key']
-                  except Exception as e:
-                      logger.error(f"Error getting stored API key: {str(e)}")
-                      return {
-                          'statusCode': 500,
-                          'headers': headers,
-                          'body': json.dumps({'error': 'Internal server error'})
-                      }
-                  
-                  # Validate API key
-                  if api_key != stored_api_key:
-                      return {
-                          'statusCode': 403,
-                          'headers': headers,
-                          'body': json.dumps({'error': 'Invalid API key'})
-                      }
-                  
-                  path = event['path']
                   http_method = event['httpMethod']
+                  path = event['path']
                   
-                  logger.info(f"Processing {http_method} request for path: {path}")
-                  
-                  if path == '/export-credentials' and http_method == 'POST':
-                      # Export all credentials
-                      secrets_list = secrets.list_secrets()
-                      credentials = {}
-                      
-                      for secret in secrets_list['SecretList']:
-                          if not secret['Name'].startswith('test-user-'):
-                              continue
-                              
-                          secret_value = json.loads(secrets.get_secret_value(SecretId=secret['Name'])['SecretString'])
-                          credentials[secret['Name']] = {
-                              'AccessKeyId': secret_value['AccessKeyId'],
-                              'SecretAccessKey': secret_value['SecretAccessKey']
-                          }
-                      
+                  if http_method == 'GET' and path == '/status':
                       return {
                           'statusCode': 200,
-                          'headers': headers,
-                          'body': json.dumps(credentials)
+                          'body': json.dumps({'status': 'healthy'})
                       }
                   
-                  elif path.startswith('/credentials/') and http_method == 'GET':
-                      # Get credentials for a specific user
-                      username = path.split('/')[-1]
-                      
+                  # Extract username from path
+                  username = path.split('/')[-1]
+                  
+                  if http_method == 'GET':
+                      # Get current credentials
+                      secret_id = f'iam-credentials-{username}'
                       try:
-                          secret_value = json.loads(secrets.get_secret_value(SecretId=username)['SecretString'])
+                          secret = secrets.get_secret_value(SecretId=secret_id)
                           return {
                               'statusCode': 200,
-                              'headers': headers,
-                              'body': json.dumps({
-                                  'AccessKeyId': secret_value['AccessKeyId'],
-                                  'SecretAccessKey': secret_value['SecretAccessKey']
-                              })
+                              'body': secret['SecretString']
                           }
                       except secrets.exceptions.ResourceNotFoundException:
                           return {
                               'statusCode': 404,
-                              'headers': headers,
-                              'body': json.dumps({'error': 'User not found'})
-                          }
-                      except Exception as e:
-                          logger.error(f"Error getting credentials for {username}: {str(e)}")
-                          return {
-                              'statusCode': 500,
-                              'headers': headers,
-                              'body': json.dumps({'error': 'Internal server error'})
+                              'body': json.dumps({'error': 'Credentials not found'})
                           }
                   
-                  elif path.startswith('/credentials/') and http_method == 'POST':
-                      # Create new credentials for a specific user
-                      username = path.split('/')[-1]
-                      
-                      try:
-                          # Create new access key
-                          new_key = iam.create_access_key(UserName=username)
-                          access_key = new_key['AccessKey']['AccessKeyId']
-                          secret_key = new_key['AccessKey']['SecretAccessKey']
-                          
-                          # Store in Secrets Manager
-                          secret_value = {
-                              'AccessKeyId': access_key,
-                              'SecretAccessKey': secret_key,
-                              'CreatedDate': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
-                              'Email': secrets.get_secret_value(SecretId=username)['SecretString'].get('Email', '')
-                          }
-                          
-                          secrets.update_secret(
-                              SecretId=username,
-                              SecretString=json.dumps(secret_value)
-                          )
-                          
-                          # Send email with masked credentials
-                          if secret_value['Email']:
-                              ses.send_email(
-                                  Source='krishank.kaushik.1@gmail.com',
-                                  Destination={'ToAddresses': [secret_value['Email']]},
-                                  Message={
-                                      'Subject': {'Data': f'New AWS Credentials for {username}'},
-                                      'Body': {'Text': {'Data': f"""
-                                      Hello,
-
-                                      New AWS credentials have been created for your account.
-                                      For security reasons, the credentials are not included in this email.
-
-                                      To access your credentials, please use the API endpoint provided in your initial setup email.
-
-                                      Important Security Notes:
-                                      1. Keep these credentials secure and never share them
-                                      2. The system will automatically rotate your keys every 10 minutes
-                                      3. You will receive email notifications for key rotation events
-                                      4. Old keys will be automatically deactivated after 12 minutes
-                                      5. Deactivated keys will be deleted after 15 minutes
-
-                                      If you have any questions, please contact your system administrator.
-
-                                      Best regards,
-                                      AWS Key Rotation System
-                                      """}}
-                                  }
-                              )
+                  elif http_method == 'POST':
+                      if path == '/export-credentials':
+                          # Export all credentials
+                          all_credentials = {}
+                          paginator = secrets.get_paginator('list_secrets')
+                          for page in paginator.paginate():
+                              for secret in page['SecretList']:
+                                  if secret['Name'].startswith('iam-credentials-'):
+                                      username = secret['Name'].replace('iam-credentials-', '')
+                                      try:
+                                          secret_value = secrets.get_secret_value(SecretId=secret['Name'])
+                                          all_credentials[username] = json.loads(secret_value['SecretString'])
+                                      except Exception as e:
+                                          logger.error(f"Error getting secret {secret['Name']}: {str(e)}")
                           
                           return {
                               'statusCode': 200,
-                              'headers': headers,
+                              'body': json.dumps(all_credentials)
+                          }
+                      
+                      # Create new credentials
+                      try:
+                          # Create new access key
+                          response = iam.create_access_key(UserName=username)
+                          new_key = response['AccessKey']
+                          
+                          # Store in Secrets Manager
+                          secret_id = f'iam-credentials-{username}'
+                          secret_value = json.dumps({
+                              'AccessKeyId': new_key['AccessKeyId'],
+                              'SecretAccessKey': new_key['SecretAccessKey'],
+                              'CreatedAt': datetime.now(timezone.utc).isoformat()
+                          })
+                          
+                          try:
+                              secrets.create_secret(
+                                  Name=secret_id,
+                                  SecretString=secret_value
+                              )
+                          except secrets.exceptions.ResourceExistsException:
+                              secrets.update_secret(
+                                  SecretId=secret_id,
+                                  SecretString=secret_value
+                              )
+                          
+                          # Send email notification
+                          to_email = get_user_email(username)
+                          send_email(
+                              to_email,
+                              'AWS IAM Access Key Created',
+                              f'New access key created for user {username}: {new_key["AccessKeyId"]}'
+                          )
+                          
+                          return {
+                              'statusCode': 200,
                               'body': json.dumps({
-                                  'AccessKeyId': access_key,
-                                  'SecretAccessKey': secret_key
+                                  'message': 'New credentials created successfully',
+                                  'accessKeyId': new_key['AccessKeyId']
                               })
                           }
                       except Exception as e:
-                          logger.error(f"Error creating credentials for {username}: {str(e)}")
+                          logger.error(f"Error creating credentials: {str(e)}")
                           return {
                               'statusCode': 500,
-                              'headers': headers,
-                              'body': json.dumps({'error': 'Internal server error'})
+                              'body': json.dumps({'error': str(e)})
                           }
                   
-                  else:
-                      return {
-                          'statusCode': 400,
-                          'headers': headers,
-                          'body': json.dumps({'error': 'Invalid request'})
-                      }
-                      
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'Invalid request'})
+                  }
               except Exception as e:
                   logger.error(f"Error handling API request: {str(e)}")
                   return {
                       'statusCode': 500,
-                      'headers': headers,
-                      'body': json.dumps({'error': 'Internal server error'})
+                      'body': json.dumps({'error': str(e)})
                   }
-      Runtime: python3.9
-      Timeout: 900
-      Environment:
-        Variables:
-          SENDER_EMAIL: !Ref SenderEmail
+          
+          def handle_rotation_event():
+              try:
+                  paginator = iam.get_paginator('list_users')
+                  for page in paginator.paginate():
+                      for user in page['Users']:
+                          username = user['UserName']
+                          
+                          if is_user_exempt(username):
+                              continue
+                          
+                          try:
+                              keys = iam.list_access_keys(UserName=username)['AccessKeyMetadata']
+                              
+                              for key in keys:
+                                  key_id = key['AccessKeyId']
+                                  created_date = key['CreateDate']
+                                  status = key['Status']
+                                  
+                                  now = datetime.now(timezone.utc)
+                                  time_since_creation = (now - created_date).total_seconds() / 60
+                                  
+                                  logger.info(f"Processing user {username}, key {key_id}")
+                                  logger.info(f"Time since creation: {time_since_creation} minutes")
+                                  
+                                  if status == 'Active' and time_since_creation >= float(os.environ['ROTATION_PERIOD']):
+                                      rotate_key(username, key_id)
+                                  elif status == 'Active' and time_since_creation >= float(os.environ['INACTIVE_PERIOD']):
+                                      deactivate_key(username, key_id)
+                                  elif status == 'Inactive' and time_since_creation >= float(os.environ['DELETION_PERIOD']):
+                                      delete_key(username, key_id)
+                          except Exception as e:
+                              logger.error(f"Error processing user {username}: {str(e)}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': 'Rotation completed successfully'})
+                  }
+              except Exception as e:
+                  logger.error(f"Error in rotation event: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def is_user_exempt(username):
+              try:
+                  response = iam.list_user_tags(UserName=username)
+                  for tag in response['Tags']:
+                      if tag['Key'] == 'KeyRotationExempt' and tag['Value'].lower() == 'true':
+                          return True
+                  return False
+              except Exception as e:
+                  logger.error(f"Error checking user exemption: {str(e)}")
+                  return False
+          
+          def rotate_key(username, old_key_id):
+              try:
+                  response = iam.create_access_key(UserName=username)
+                  new_key = response['AccessKey']
+                  
+                  secret_id = f'iam-credentials-{username}'
+                  secret_value = json.dumps({
+                      'AccessKeyId': new_key['AccessKeyId'],
+                      'SecretAccessKey': new_key['SecretAccessKey'],
+                      'CreatedAt': datetime.now(timezone.utc).isoformat()
+                  })
+                  
+                  try:
+                      secrets.create_secret(
+                          Name=secret_id,
+                          SecretString=secret_value
+                      )
+                  except secrets.exceptions.ResourceExistsException:
+                      secrets.update_secret(
+                          SecretId=secret_id,
+                          SecretString=secret_value
+                      )
+                  
+                  to_email = get_user_email(username)
+                  send_email(
+                      to_email,
+                      'AWS IAM Access Key Rotation',
+                      f'New access key created for user {username}: {new_key["AccessKeyId"]}'
+                  )
+                  
+                  logger.info(f"Rotated key for user {username}")
+              except Exception as e:
+                  logger.error(f"Error rotating key: {str(e)}")
+          
+          def deactivate_key(username, key_id):
+              try:
+                  iam.update_access_key(
+                      UserName=username,
+                      AccessKeyId=key_id,
+                      Status='Inactive'
+                  )
+                  
+                  to_email = get_user_email(username)
+                  send_email(
+                      to_email,
+                      'AWS IAM Access Key Deactivated',
+                      f'Access key deactivated for user {username}: {key_id}'
+                  )
+                  
+                  logger.info(f"Deactivated key {key_id} for user {username}")
+              except Exception as e:
+                  logger.error(f"Error deactivating key: {str(e)}")
+          
+          def delete_key(username, key_id):
+              try:
+                  iam.delete_access_key(
+                      UserName=username,
+                      AccessKeyId=key_id
+                  )
+                  
+                  to_email = get_user_email(username)
+                  send_email(
+                      to_email,
+                      'AWS IAM Access Key Deleted',
+                      f'Access key deleted for user {username}: {key_id}'
+                  )
+                  
+                  logger.info(f"Deleted key {key_id} for user {username}")
+              except Exception as e:
+                  logger.error(f"Error deleting key: {str(e)}")
 
   KeyRotationRole:
     Type: AWS::IAM::Role
@@ -445,15 +447,18 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
-                  - iam:CreateAccessKey
-                  - iam:DeleteAccessKey
-                  - iam:UpdateAccessKey
+                  - iam:ListUsers
                   - iam:ListAccessKeys
+                  - iam:CreateAccessKey
+                  - iam:UpdateAccessKey
+                  - iam:DeleteAccessKey
                   - iam:GetUser
+                  - iam:ListUserTags
                 Resource: '*'
               - Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
+                  - secretsmanager:CreateSecret
                   - secretsmanager:UpdateSecret
                   - secretsmanager:ListSecrets
                 Resource: '*'
@@ -463,73 +468,56 @@ Resources:
                   - ses:SendRawEmail
                 Resource: '*'
 
-  KeyRotationSchedule:
-    Type: AWS::Events::Rule
+  KeyRotationApi:
+    Type: AWS::ApiGateway::RestApi
     Properties:
-      Description: 'Schedule for key rotation'
-      ScheduleExpression: rate(10 minutes)
-      State: ENABLED
-      Targets:
-        - Arn: !GetAtt KeyRotationFunction.Arn
-          Id: KeyRotationFunction
-          Input: '{"action": "rotate"}'
+      Name: KeyRotationApi
+      Description: API for IAM key rotation
 
-  KeyDeactivationSchedule:
-    Type: AWS::Events::Rule
+  KeyRotationApiResource:
+    Type: AWS::ApiGateway::Resource
     Properties:
-      Description: 'Schedule for key deactivation'
-      ScheduleExpression: rate(12 minutes)
-      State: ENABLED
-      Targets:
-        - Arn: !GetAtt KeyRotationFunction.Arn
-          Id: KeyRotationFunction
-          Input: '{"action": "deactivate"}'
+      RestApiId: !Ref KeyRotationApi
+      ParentId: !GetAtt KeyRotationApi.RootResourceId
+      PathPart: status
 
-  KeyDeletionSchedule:
-    Type: AWS::Events::Rule
+  KeyRotationApiMethod:
+    Type: AWS::ApiGateway::Method
     Properties:
-      Description: 'Schedule for key deletion'
-      ScheduleExpression: rate(15 minutes)
-      State: ENABLED
-      Targets:
-        - Arn: !GetAtt KeyRotationFunction.Arn
-          Id: KeyRotationFunction
-          Input: '{"action": "delete"}'
+      RestApiId: !Ref KeyRotationApi
+      ResourceId: !Ref KeyRotationApiResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${KeyRotationFunction.Arn}/invocations
 
-  KeyRotationPermission:
+  KeyRotationApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: KeyRotationApiMethod
+    Properties:
+      RestApiId: !Ref KeyRotationApi
+
+  KeyRotationApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref KeyRotationApi
+      DeploymentId: !Ref KeyRotationApiDeployment
+      StageName: prod
+
+  KeyRotationApiPermission:
     Type: AWS::Lambda::Permission
     Properties:
       Action: lambda:InvokeFunction
       FunctionName: !Ref KeyRotationFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt KeyRotationSchedule.Arn
-
-  KeyDeactivationPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !Ref KeyRotationFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt KeyDeactivationSchedule.Arn
-
-  KeyDeletionPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !Ref KeyRotationFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt KeyDeletionSchedule.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${KeyRotationApi}/*/GET/status
 
 Outputs:
-  KeyRotationFunction:
-    Description: 'Lambda function for key rotation'
+  KeyRotationFunctionArn:
+    Description: Key Rotation Lambda Function ARN
     Value: !GetAtt KeyRotationFunction.Arn
-  KeyRotationSchedule:
-    Description: 'EventBridge rule for key rotation'
-    Value: !GetAtt KeyRotationSchedule.Arn
-  KeyDeactivationSchedule:
-    Description: 'EventBridge rule for key deactivation'
-    Value: !GetAtt KeyDeactivationSchedule.Arn
-  KeyDeletionSchedule:
-    Description: 'EventBridge rule for key deletion'
-    Value: !GetAtt KeyDeletionSchedule.Arn 
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${KeyRotationApi}.execute-api.${AWS::Region}.amazonaws.com/prod/status 

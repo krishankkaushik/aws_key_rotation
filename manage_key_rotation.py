@@ -8,6 +8,8 @@ import argparse
 from botocore.exceptions import ClientError
 from botocore.config import Config
 import json
+from datetime import datetime, timedelta, timezone
+import os
 
 # Configure logging
 logging.basicConfig(
@@ -28,7 +30,7 @@ config = Config(
 )
 
 class KeyRotationManager:
-    def __init__(self):
+    def __init__(self, sender_email):
         """Initialize AWS clients."""
         self.iam = boto3.client('iam', config=config)
         self.secrets = boto3.client('secretsmanager', config=config)
@@ -40,6 +42,7 @@ class KeyRotationManager:
         self.region = boto3.session.Session().region_name
         self.api_id = None
         self.api_key = None
+        self.sender_email = sender_email
 
     def cleanup(self):
         """Clean up all AWS resources."""
@@ -49,7 +52,7 @@ class KeyRotationManager:
         logger.info("Cleaning up API Gateway...")
         apis = self.apigw.get_rest_apis()
         for api in apis['items']:
-            if api['name'] == 'key-rotation-api':
+            if api['name'] == 'KeyRotationApi':
                 try:
                     self.apigw.delete_rest_api(restApiId=api['id'])
                     logger.info(f"Deleting API Gateway: {api['id']}")
@@ -63,24 +66,25 @@ class KeyRotationManager:
 
         # 2. Delete EventBridge rules
         logger.info("Cleaning up EventBridge rules...")
-        rules = self.events.list_rules(NamePrefix='key-rotation')
+        rules = self.events.list_rules()
         for rule in rules['Rules']:
-            try:
-                targets = self.events.list_targets_by_rule(Rule=rule['Name'])
-                if targets['Targets']:
-                    self.events.remove_targets(
-                        Rule=rule['Name'],
-                        Ids=[target['Id'] for target in targets['Targets']]
-                    )
-                self.events.delete_rule(Name=rule['Name'])
-                logger.info(f"Deleted EventBridge rule: {rule['Name']}")
-                time.sleep(5)
-            except ClientError as e:
-                if e.response['Error']['Code'] == 'TooManyRequestsException':
-                    logger.warning("Rate limit hit, waiting 30 seconds...")
-                    time.sleep(30)
-                    continue
-                raise
+            if rule['Name'].startswith('KeyRotation'):
+                try:
+                    targets = self.events.list_targets_by_rule(Rule=rule['Name'])
+                    if targets['Targets']:
+                        self.events.remove_targets(
+                            Rule=rule['Name'],
+                            Ids=[target['Id'] for target in targets['Targets']]
+                        )
+                    self.events.delete_rule(Name=rule['Name'])
+                    logger.info(f"Deleted EventBridge rule: {rule['Name']}")
+                    time.sleep(5)
+                except ClientError as e:
+                    if e.response['Error']['Code'] == 'TooManyRequestsException':
+                        logger.warning("Rate limit hit, waiting 30 seconds...")
+                        time.sleep(30)
+                        continue
+                    raise
 
         # 3. Delete Lambda function
         logger.info("Cleaning up Lambda function...")
@@ -96,9 +100,9 @@ class KeyRotationManager:
 
         # 4. Delete Secrets Manager secrets
         logger.info("Cleaning up Secrets Manager secrets...")
-        secrets_list = self.secrets.list_secrets()
-        for secret in secrets_list['SecretList']:
-            if secret['Name'].startswith('test-user-'):
+        secrets = self.secrets.list_secrets()
+        for secret in secrets['SecretList']:
+            if secret['Name'].startswith('iam-key-rotation/') or secret['Name'] == 'key-rotation-api-key':
                 try:
                     self.secrets.delete_secret(
                         SecretId=secret['Name'],
@@ -153,7 +157,7 @@ class KeyRotationManager:
         logger.info("Starting deployment...")
         
         # Read the template file
-        with open('key_rotation.yaml', 'r') as f:
+        with open('key_rotation_minimal.yaml', 'r') as f:
             template_body = f.read()
         
         # Create or update the stack
@@ -161,359 +165,172 @@ class KeyRotationManager:
             self.cloudformation.create_stack(
                 StackName='iam-key-rotation',
                 TemplateBody=template_body,
-                Capabilities=['CAPABILITY_IAM'],
                 Parameters=[
                     {
-                        'ParameterKey': 'RotationInterval',
+                        'ParameterKey': 'SenderEmail',
+                        'ParameterValue': self.sender_email
+                    },
+                    {
+                        'ParameterKey': 'RotationPeriod',
                         'ParameterValue': '10'
                     },
                     {
-                        'ParameterKey': 'DeactivationInterval',
+                        'ParameterKey': 'InactivePeriod',
                         'ParameterValue': '12'
                     },
                     {
-                        'ParameterKey': 'DeletionInterval',
+                        'ParameterKey': 'DeletionPeriod',
                         'ParameterValue': '15'
-                    },
+                    }
+                ],
+                Capabilities=['CAPABILITY_IAM']
+            )
+            logger.info("Stack creation initiated")
+        except self.cloudformation.exceptions.AlreadyExistsException:
+            self.cloudformation.update_stack(
+                StackName='iam-key-rotation',
+                TemplateBody=template_body,
+                Parameters=[
                     {
                         'ParameterKey': 'SenderEmail',
-                        'ParameterValue': 'krishank.kaushik.1@gmail.com'
+                        'ParameterValue': self.sender_email
+                    },
+                    {
+                        'ParameterKey': 'RotationPeriod',
+                        'ParameterValue': '10'
+                    },
+                    {
+                        'ParameterKey': 'InactivePeriod',
+                        'ParameterValue': '12'
+                    },
+                    {
+                        'ParameterKey': 'DeletionPeriod',
+                        'ParameterValue': '15'
+                    }
+                ],
+                Capabilities=['CAPABILITY_IAM']
+            )
+            logger.info("Stack update initiated")
+        
+        # Wait for stack to complete
+        waiter = self.cloudformation.get_waiter('stack_create_complete')
+        waiter.wait(StackName='iam-key-rotation')
+        logger.info("Stack deployment completed successfully")
+
+    def setup_api(self):
+        """Set up API Gateway and store API key."""
+        try:
+            # Get Lambda function ARN from CloudFormation stack
+            stack = self.cloudformation.describe_stacks(StackName='iam-key-rotation')
+            lambda_arn = None
+            for output in stack['Stacks'][0]['Outputs']:
+                if output['OutputKey'] == 'KeyRotationFunction':
+                    lambda_arn = output['OutputValue']
+                    break
+            
+            if not lambda_arn:
+                raise Exception("Could not find Lambda function ARN in stack outputs")
+
+            # Create API Gateway
+            api = self.apigw.create_rest_api(
+                name='KeyRotationApi',
+                description='API for IAM key rotation'
+            )
+            logger.info(f"Created API Gateway: {api['id']}")
+
+            # Create API key
+            api_key = self.apigw.create_api_key(
+                name='KeyRotationApiKey',
+                description='API key for key rotation system',
+                enabled=True
+            )
+            logger.info(f"Created new permanent API key: {api_key['id']}")
+
+            # Store API key in Secrets Manager
+            self.secrets.create_secret(
+                Name='key-rotation-api-key',
+                SecretString=json.dumps({'api_key': api_key['value']})
+            )
+            logger.info("Stored API key in Secrets Manager")
+
+            # Create usage plan and associate with API key
+            usage_plan = self.apigw.create_usage_plan(
+                name='KeyRotationUsagePlan',
+                apiStages=[
+                    {
+                        'apiId': api['id'],
+                        'stage': 'prod'
                     }
                 ]
             )
-            logger.info("Creating CloudFormation stack...")
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'AlreadyExistsException':
-                self.cloudformation.update_stack(
-                    StackName='iam-key-rotation',
-                    TemplateBody=template_body,
-                    Capabilities=['CAPABILITY_IAM'],
-                    Parameters=[
-                        {
-                            'ParameterKey': 'RotationInterval',
-                            'ParameterValue': '10'
-                        },
-                        {
-                            'ParameterKey': 'DeactivationInterval',
-                            'ParameterValue': '12'
-                        },
-                        {
-                            'ParameterKey': 'DeletionInterval',
-                            'ParameterValue': '15'
-                        },
-                        {
-                            'ParameterKey': 'SenderEmail',
-                            'ParameterValue': 'krishank.kaushik.1@gmail.com'
-                        }
-                    ]
-                )
-                logger.info("Updating CloudFormation stack...")
-            else:
-                raise
+            self.apigw.create_usage_plan_key(
+                usagePlanId=usage_plan['id'],
+                keyId=api_key['id'],
+                keyType='API_KEY'
+            )
 
-        # Wait for stack creation/update
-        try:
-            waiter = self.cloudformation.get_waiter('stack_create_complete')
-            waiter.wait(StackName='iam-key-rotation')
-            logger.info("CloudFormation stack created successfully")
-        except:
-            waiter = self.cloudformation.get_waiter('stack_update_complete')
-            waiter.wait(StackName='iam-key-rotation')
-            logger.info("CloudFormation stack updated successfully")
-
-        # Get the Lambda function name
-        resources = self.cloudformation.list_stack_resources(StackName='iam-key-rotation')
-        lambda_function = next((r for r in resources['StackResourceSummaries'] 
-                              if r['ResourceType'] == 'AWS::Lambda::Function'), None)
-        
-        if lambda_function:
-            logger.info(f"Lambda function created: {lambda_function['PhysicalResourceId']}")
-        else:
-            logger.error("Lambda function not found in stack resources")
+            logger.info("API Gateway setup completed successfully")
+            logger.info(f"API Key: {api_key['value']}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set up API Gateway: {str(e)}")
             return False
 
-        return True
-
-    def setup_api(self):
-        """Set up API Gateway."""
-        logger.info("Setting up API Gateway...")
-        
-        # Get Lambda function ARN
-        lambda_function = self.lambda_client.get_function(
-            FunctionName='iam-key-rotation-KeyRotationFunction-tSqkEMN96R3N'
-        )
-        lambda_arn = lambda_function['Configuration']['FunctionArn']
-        
-        # Create REST API
-        api = self.apigw.create_rest_api(
-            name='key-rotation-api',
-            description='API for AWS key rotation system'
-        )
-        self.api_id = api['id']
-        logger.info(f"Created API Gateway: {self.api_id}")
-        
-        # Get root resource ID
-        resources = self.apigw.get_resources(restApiId=self.api_id)
-        root_id = resources['items'][0]['id']
-        
-        # Create /credentials resource
-        credentials_resource = self.apigw.create_resource(
-            restApiId=self.api_id,
-            parentId=root_id,
-            pathPart='credentials'
-        )
-        credentials_id = credentials_resource['id']
-        
-        # Create /credentials/{username} resource
-        username_resource = self.apigw.create_resource(
-            restApiId=self.api_id,
-            parentId=credentials_id,
-            pathPart='{username}'
-        )
-        username_id = username_resource['id']
-        
-        # Create /export-credentials resource
-        export_resource = self.apigw.create_resource(
-            restApiId=self.api_id,
-            parentId=root_id,
-            pathPart='export-credentials'
-        )
-        export_id = export_resource['id']
-        
-        # Create Lambda permission for API Gateway
-        try:
-            source_arn = f'arn:aws:execute-api:{self.region}:{self.get_account_id()}:{self.api_id}/*/*/*'
-            self.lambda_client.add_permission(
-                FunctionName=lambda_arn,
-                StatementId='apigateway-invoke',
-                Action='lambda:InvokeFunction',
-                Principal='apigateway.amazonaws.com',
-                SourceArn=source_arn
-            )
-            logger.info(f"Added Lambda permission with source ARN: {source_arn}")
-        except ClientError as e:
-            if e.response['Error']['Code'] != 'ResourceConflictException':
-                raise
-            logger.info("Lambda permission already exists")
-        
-        # Create methods and integrations
-        # GET /credentials/{username}
-        self.apigw.put_method(
-            restApiId=self.api_id,
-            resourceId=username_id,
-            httpMethod='GET',
-            authorizationType='NONE',
-            apiKeyRequired=True
-        )
-        
-        # Add CORS configuration
-        self.apigw.put_method_response(
-            restApiId=self.api_id,
-            resourceId=username_id,
-            httpMethod='GET',
-            statusCode='200',
-            responseParameters={
-                'method.response.header.Access-Control-Allow-Origin': True,
-                'method.response.header.Access-Control-Allow-Headers': True
-            }
-        )
-        
-        self.apigw.put_integration(
-            restApiId=self.api_id,
-            resourceId=username_id,
-            httpMethod='GET',
-            type='AWS_PROXY',
-            integrationHttpMethod='POST',
-            uri=f'arn:aws:apigateway:{self.region}:lambda:path/2015-03-31/functions/{lambda_arn}/invocations'
-        )
-        
-        # POST /credentials/{username}
-        self.apigw.put_method(
-            restApiId=self.api_id,
-            resourceId=username_id,
-            httpMethod='POST',
-            authorizationType='NONE',
-            apiKeyRequired=True
-        )
-        
-        # Add CORS configuration
-        self.apigw.put_method_response(
-            restApiId=self.api_id,
-            resourceId=username_id,
-            httpMethod='POST',
-            statusCode='200',
-            responseParameters={
-                'method.response.header.Access-Control-Allow-Origin': True,
-                'method.response.header.Access-Control-Allow-Headers': True
-            }
-        )
-        
-        self.apigw.put_integration(
-            restApiId=self.api_id,
-            resourceId=username_id,
-            httpMethod='POST',
-            type='AWS_PROXY',
-            integrationHttpMethod='POST',
-            uri=f'arn:aws:apigateway:{self.region}:lambda:path/2015-03-31/functions/{lambda_arn}/invocations'
-        )
-        
-        # POST /export-credentials
-        self.apigw.put_method(
-            restApiId=self.api_id,
-            resourceId=export_id,
-            httpMethod='POST',
-            authorizationType='NONE',
-            apiKeyRequired=True
-        )
-        
-        # Add CORS configuration
-        self.apigw.put_method_response(
-            restApiId=self.api_id,
-            resourceId=export_id,
-            httpMethod='POST',
-            statusCode='200',
-            responseParameters={
-                'method.response.header.Access-Control-Allow-Origin': True,
-                'method.response.header.Access-Control-Allow-Headers': True
-            }
-        )
-        
-        self.apigw.put_integration(
-            restApiId=self.api_id,
-            resourceId=export_id,
-            httpMethod='POST',
-            type='AWS_PROXY',
-            integrationHttpMethod='POST',
-            uri=f'arn:aws:apigateway:{self.region}:lambda:path/2015-03-31/functions/{lambda_arn}/invocations'
-        )
-        
-        # Create deployment
-        deployment = self.apigw.create_deployment(
-            restApiId=self.api_id,
-            stageName='prod'
-        )
-        
-        # Wait for deployment to complete
-        logger.info("Waiting for API deployment to complete...")
-        time.sleep(10)
-        
-        # Create new permanent API key
-        api_key = self.apigw.create_api_key(
-            name='key-rotation-api-key',
-            enabled=True,
-            description='Permanent API key for key rotation system'
-        )
-        logger.info(f"Created new permanent API key: {api_key['id']}")
-        api_key_id = api_key['id']
-        
-        # Get API key value
-        api_key_details = self.apigw.get_api_key(
-            apiKey=api_key['id'],
-            includeValue=True
-        )
-        self.api_key = api_key_details['value']
-        
-        # Store API key in Secrets Manager
-        try:
-            self.secrets.create_secret(
-                Name='key-rotation-api-key',
-                SecretString=json.dumps({'api_key': self.api_key}),
-                Description='Permanent API key for key rotation system'
-            )
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'ResourceExistsException':
-                self.secrets.update_secret(
-                    SecretId='key-rotation-api-key',
-                    SecretString=json.dumps({'api_key': self.api_key})
-                )
-        logger.info("Stored API key in Secrets Manager")
-        
-        # Create usage plan
-        usage_plan = self.apigw.create_usage_plan(
-            name='key-rotation-usage-plan',
-            apiStages=[
-                {
-                    'apiId': self.api_id,
-                    'stage': 'prod'
-                }
-            ],
-            throttle={
-                'rateLimit': 1000,
-                'burstLimit': 2000
-            }
-        )
-        
-        # Associate API key with usage plan
-        self.apigw.create_usage_plan_key(
-            usagePlanId=usage_plan['id'],
-            keyId=api_key_id,
-            keyType='API_KEY'
-        )
-        
-        # Enable API key for the stage
-        self.apigw.update_stage(
-            restApiId=self.api_id,
-            stageName='prod',
-            patchOperations=[
-                {
-                    'op': 'replace',
-                    'path': '/*/*/throttling/rateLimit',
-                    'value': '1000'
-                },
-                {
-                    'op': 'replace',
-                    'path': '/*/*/throttling/burstLimit',
-                    'value': '2000'
-                }
-            ]
-        )
-        
-        logger.info("API Gateway setup completed successfully")
-        logger.info(f"API Key: {self.api_key}")
-        return self.api_id, self.api_key
-
     def setup_initial_keys(self):
-        """Set up initial access keys for all users."""
+        """Set up initial access keys for all IAM users."""
         logger.info("Setting up initial access keys...")
         
-        # List all IAM users
-        users = self.iam.list_users()['Users']
+        # Get all IAM users
+        paginator = self.iam.get_paginator('list_users')
+        users = []
+        for page in paginator.paginate():
+            users.extend(page['Users'])
+
         logger.info(f"Found {len(users)} IAM users")
-        
         success_count = 0
+
         for user in users:
             username = user['UserName']
-            if not username.startswith('test-user-'):
-                continue
-                
             logger.info(f"Processing user: {username}")
-            
-            # Get user's email
-            email = self.get_user_email(username)
-            
-            # Create access key
-            access_key = self.create_access_key(username)
-            if not access_key:
+
+            # Skip users in exemption group
+            if self.is_user_exempt(username):
+                logger.info(f"Skipping exempt user: {username}")
                 continue
+
+            try:
+                # List existing keys
+                existing_keys = self.iam.list_access_keys(UserName=username)
                 
-            # Store in Secrets Manager
-            if not self.store_in_secrets_manager(
-                username, 
-                access_key['AccessKeyId'], 
-                access_key['SecretAccessKey'],
-                email
-            ):
+                # Delete existing keys
+                for key in existing_keys['AccessKeyMetadata']:
+                    logger.info(f"Deleting existing key {key['AccessKeyId']} for user {username}")
+                    self.iam.delete_access_key(
+                        UserName=username,
+                        AccessKeyId=key['AccessKeyId']
+                    )
+                    time.sleep(1)  # Small delay to avoid rate limits
+
+                # Create new access key
+                new_key = self.iam.create_access_key(UserName=username)
+                access_key = new_key['AccessKey']['AccessKeyId']
+                secret_key = new_key['AccessKey']['SecretAccessKey']
+
+                # Store in Secrets Manager
+                if self.store_in_secrets_manager(username, access_key, secret_key, user.get('Email')):
+                    # Send email notification
+                    self.send_email(
+                        user.get('Email', self.sender_email),
+                        'AWS IAM Access Key Created',
+                        f'New IAM access key has been created for your account: {access_key}'
+                    )
+                    success_count += 1
+                    logger.info(f"Successfully set up new key for user {username}")
+
+            except Exception as e:
+                logger.error(f"Failed to process user {username}: {str(e)}")
                 continue
-                
-            # Send email
-            if self.send_credentials_email(
-                email,
-                username,
-                access_key['AccessKeyId'],
-                access_key['SecretAccessKey']
-            ):
-                success_count += 1
-                
+
         logger.info(f"Successfully set up credentials for {success_count} users")
 
     def get_account_id(self):
@@ -521,147 +338,128 @@ class KeyRotationManager:
         sts = boto3.client('sts')
         return sts.get_caller_identity()['Account']
 
-    def get_user_email(self, username):
-        """Get user's email from IAM tags."""
+    def is_user_exempt(self, username):
+        """Check if user is in exemption group."""
         try:
-            response = self.iam.get_user(UserName=username)
-            email = next((tag['Value'] for tag in response['User']['Tags'] 
-                         if tag['Key'] == 'email'), None)
-            return email
-        except ClientError as e:
-            logger.error(f"Error getting email for {username}: {str(e)}")
-            return None
+            response = self.iam.list_groups_for_user(UserName=username)
+            for group in response['Groups']:
+                if group['GroupName'] == 'IAMKeyRotationExemptionGroup':
+                    return True
+            return False
+        except Exception as e:
+            logger.error(f"Failed to check user exemption: {str(e)}")
+            return False
 
-    def create_access_key(self, username):
-        """Create a new access key for the user."""
+    def store_in_secrets_manager(self, username, access_key, secret_key, email=None):
+        """Store credentials in Secrets Manager with state tracking."""
         try:
-            response = self.iam.create_access_key(UserName=username)
-            return response['AccessKey']
-        except ClientError as e:
-            logger.error(f"Error creating access key for {username}: {str(e)}")
-            return None
-
-    def store_in_secrets_manager(self, username, access_key, secret_key, email):
-        """Store credentials in Secrets Manager."""
-        try:
+            secret_name = f'iam-key-rotation/{username}'
             secret_value = {
                 'AccessKeyId': access_key,
                 'SecretAccessKey': secret_key,
-                'CreatedDate': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                'Email': email
+                'CreationDate': datetime.now(timezone.utc).isoformat(),
+                'State': 'ACTIVE',
+                'Email': email or self.sender_email
             }
             
             try:
+                # Try to create new secret
                 self.secrets.create_secret(
-                    Name=username,
-                    SecretString=json.dumps(secret_value),
-                    Description=f'AWS credentials for {username}'
+                    Name=secret_name,
+                    SecretString=json.dumps(secret_value)
                 )
+                logger.info(f"Created new secret in Secrets Manager for {username}")
             except ClientError as e:
                 if e.response['Error']['Code'] == 'ResourceExistsException':
+                    # Update existing secret
                     self.secrets.update_secret(
-                        SecretId=username,
+                        SecretId=secret_name,
                         SecretString=json.dumps(secret_value)
                     )
+                    logger.info(f"Updated existing secret in Secrets Manager for {username}")
                 else:
                     raise
-                    
-            logger.info(f"Stored credentials in Secrets Manager for {username}")
+            
             return True
-        except ClientError as e:
-            logger.error(f"Error storing credentials for {username}: {str(e)}")
+        except Exception as e:
+            logger.error(f"Failed to store credentials for {username}: {str(e)}")
             return False
 
-    def send_credentials_email(self, email, username, access_key, secret_key):
-        """Send credentials email to user."""
-        if not email:
-            logger.warning(f"No email found for {username}, skipping email notification")
-            return False
-            
+    def send_email(self, to_email, subject, body):
+        """Send email notification."""
         try:
-            # Get API Gateway endpoint and key
-            api_endpoint = f"https://{self.api_id}.execute-api.{self.region}.amazonaws.com/prod"
-            
-            # Create email body
-            body = f"""Hello,
-
-Your AWS credentials have been set up successfully.
-
-You can use these credentials to access AWS services. The credentials are also stored in AWS Secrets Manager.
-
-To access your credentials programmatically, you can use the following API endpoint:
-{api_endpoint}
-
-Your API Key: {self.api_key}
-
-Example API calls:
-
-1. Get your credentials:
-curl -H "X-API-Key: {self.api_key}" {api_endpoint}/credentials/{username}
-
-2. Create new credentials (if needed):
-curl -X POST -H "X-API-Key: {self.api_key}" {api_endpoint}/credentials/{username}
-
-3. Export all credentials:
-curl -X POST -H "X-API-Key: {self.api_key}" {api_endpoint}/export-credentials
-
-Important Security Notes:
-1. Keep these credentials secure and never share them
-2. The system will automatically rotate your keys every 10 minutes
-3. You will receive email notifications for key rotation events
-4. Old keys will be automatically deactivated after 12 minutes
-5. Deactivated keys will be deleted after 15 minutes
-
-If you have any questions, please contact your system administrator.
-
-Best regards,
-AWS Key Rotation System
-"""
-            
-            # Send email
-            self.ses.send_email(
-                Source='krishank.kaushik.1@gmail.com',
-                Destination={'ToAddresses': [email]},
+            response = self.ses.send_email(
+                Source=self.sender_email,
+                Destination={'ToAddresses': [to_email]},
                 Message={
-                    'Subject': {'Data': f'AWS Credentials for {username}'},
+                    'Subject': {'Data': subject},
                     'Body': {'Text': {'Data': body}}
                 }
             )
-            
-            logger.info(f"Sent credentials email to {email}")
+            logger.info(f"Email sent successfully: {response['MessageId']}")
             return True
-            
-        except ClientError as e:
-            logger.error(f"Error sending email to {email}: {str(e)}")
+        except Exception as e:
+            logger.error(f"Failed to send email: {str(e)}")
             return False
 
+def deploy_stack(sender_email):
+    try:
+        logger.info("Starting deployment...")
+        cf = boto3.client('cloudformation')
+        
+        # Read the template file
+        with open('key_rotation_minimal.yaml', 'r') as f:
+            template_body = f.read()
+        
+        # Check if stack exists
+        try:
+            cf.describe_stacks(StackName='iam-key-rotation')
+            logger.info("Stack exists, updating...")
+            cf.update_stack(
+                StackName='iam-key-rotation',
+                TemplateBody=template_body,
+                Parameters=[
+                    {
+                        'ParameterKey': 'SenderEmail',
+                        'ParameterValue': sender_email
+                    }
+                ],
+                Capabilities=['CAPABILITY_IAM']
+            )
+        except cf.exceptions.ClientError as e:
+            if 'does not exist' in str(e):
+                logger.info("Stack does not exist, creating...")
+                cf.create_stack(
+                    StackName='iam-key-rotation',
+                    TemplateBody=template_body,
+                    Parameters=[
+                        {
+                            'ParameterKey': 'SenderEmail',
+                            'ParameterValue': sender_email
+                        }
+                    ],
+                    Capabilities=['CAPABILITY_IAM']
+                )
+            else:
+                raise
+        
+        logger.info("Deployment completed successfully")
+    except Exception as e:
+        logger.error(f"Error in deploy_stack: {str(e)}")
+        raise
+
 def main():
-    """Main function."""
-    parser = argparse.ArgumentParser(description='Manage AWS Key Rotation System')
-    parser.add_argument('action', choices=['cleanup', 'deploy', 'setup', 'all'],
-                      help='Action to perform: cleanup, deploy, setup, or all')
-    parser.add_argument('--sender-email', required=True, help='Email address for sending notifications')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--sender-email', required=True, help='Email address to send notifications from')
+    parser.add_argument('action', choices=['cleanup', 'deploy', 'setup', 'all'], help='Action to perform')
     args = parser.parse_args()
     
     try:
-        manager = KeyRotationManager()
-        
-        if args.action == 'cleanup':
-            manager.cleanup()
-        elif args.action == 'deploy':
-            manager.deploy()
-        elif args.action == 'setup':
-            manager.setup_api()
-            manager.setup_initial_keys()
-        elif args.action == 'all':
-            manager.cleanup()
-            if manager.deploy():
-                manager.setup_api()
-                manager.setup_initial_keys()
-        
+        if args.action in ['deploy', 'all']:
+            deploy_stack(args.sender_email)
     except Exception as e:
         logger.error(f"Error in main: {str(e)}")
-        sys.exit(1)
+        raise
 
 if __name__ == '__main__':
     main() 
