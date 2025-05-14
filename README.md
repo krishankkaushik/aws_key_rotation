@@ -1,129 +1,122 @@
 # AWS IAM Key Rotation System
 
-A production-grade system for automatic rotation of AWS IAM access keys with monitoring, notifications, and a REST API for credential management.
+This system provides automated rotation of AWS IAM access keys with the following features:
 
-## Features
+1. **Automated Key Rotation**:
+   - Keys are rotated every 5 minutes
+   - Old keys are deactivated after 2 minutes
+   - Deactivated keys are deleted after 1 minute
+   - Email notifications for all key events
 
-- Automatic key rotation every 30 minutes
-- Key deactivation after 1 hour
-- Key deletion after 1.5 hours
-- Email notifications for key events
-- CloudWatch dashboard for monitoring
-- Secrets Manager integration for key storage
-- REST API for credential management
-- Credential caching with TTL
-- Secure API key authentication
+2. **Secure Key Storage**:
+   - Keys are stored in AWS Secrets Manager
+   - No hardcoding of keys in code
+   - Proper access controls and encryption
 
-## Project Structure
-
-```
-aws_key_rotation_task/
-├── src/
-│   ├── api.py              # FastAPI application for credential management
-│   └── credential_manager.py # Credential caching and management
-├── key_rotation_template.yaml  # CloudFormation template
-├── setup_aws_resources.py  # AWS resource setup script
-├── requirements.txt        # Python dependencies
-└── README.md              # This file
-```
+3. **Flexible Access Patterns**:
+   - Direct API access for CI/CD pipelines
+   - REST API for programmatic access
+   - Email notifications with API usage instructions
 
 ## Prerequisites
 
-1. AWS CLI configured with appropriate permissions
-2. SES verified email addresses for notifications
-3. Python 3.9 or later
-4. Virtual environment (recommended)
+- Python 3.9+
+- AWS CLI configured with appropriate permissions
+- AWS SES configured for email notifications
 
 ## Setup
 
-1. Create and activate virtual environment:
+1. **Install Dependencies**:
    ```bash
    python -m venv .venv
-   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-   ```
-
-2. Install dependencies:
-   ```bash
+   source .venv/bin/activate
    pip install -r requirements.txt
    ```
 
-3. Configure AWS credentials:
+2. **Deploy CloudFormation Stack**:
    ```bash
-   aws configure
+   aws cloudformation deploy \
+     --template-file key_rotation.yaml \
+     --stack-name iam-key-rotation \
+     --parameter-overrides \
+       SenderEmail=your-email@example.com \
+       AdminEmail=admin@example.com \
+     --capabilities CAPABILITY_IAM
    ```
 
-4. Deploy the CloudFormation stack:
+3. **Configure Environment Variables**:
    ```bash
-   python setup_aws_resources.py --admin-email your-admin@example.com --sender-email your-sender@example.com
+   export API_KEY=your-secure-api-key
    ```
 
-## API Usage
+4. **Start the API Server**:
+   ```bash
+   python api.py
+   ```
 
-The system provides a REST API for credential management:
+## Usage
 
-1. Get credentials for a user:
+### API Endpoints
+
+1. **Get Credentials for a User**:
    ```bash
    curl -H "X-API-Key: your-api-key" http://localhost:8000/credentials/username
    ```
 
-2. List all users with credentials:
+2. **Get All Credentials**:
    ```bash
-   curl -H "X-API-Key: your-api-key" http://localhost:8000/users
+   curl -H "X-API-Key: your-api-key" http://localhost:8000/credentials
    ```
 
-3. Health check:
-   ```bash
-   curl http://localhost:8000/health
-   ```
+### Email Notifications
 
-## Monitoring
+The system sends email notifications for the following events:
+1. New key creation
+2. Key deactivation
+3. Key deletion
 
-The system includes a CloudWatch dashboard with:
-- Key rotation status metrics
-- Email notification metrics
-- Error tracking
-- API usage metrics
+Each email includes:
+- Event details
+- Timestamp
+- API usage instructions
+- Security best practices
 
-Access the dashboard through the CloudFormation stack outputs.
+## Security Considerations
 
-## Key Rotation Process
+1. **API Security**:
+   - All API endpoints require an API key
+   - API key should be rotated regularly
+   - Use HTTPS in production
 
-1. Every 5 minutes, the Lambda function checks for keys that need rotation
-2. Keys older than 30 minutes are rotated:
-   - Old keys are deactivated
-   - New keys are created
-   - Keys are stored in Secrets Manager
-3. Inactive keys older than 1 hour are deleted
-4. Email notifications are sent for all key events
+2. **Key Storage**:
+   - Keys are encrypted at rest in Secrets Manager
+   - Access is controlled via IAM policies
+   - No hardcoded credentials in code
 
-## Security
-
-- Only users with prefix `test-user-` are included in rotation
-- Keys are stored securely in Secrets Manager
-- All operations are logged and monitored
-- Email notifications include key status changes
-- API endpoints are protected with API key authentication
-- Credentials are cached with TTL for performance
+3. **Monitoring**:
+   - CloudWatch logs for Lambda function
+   - API access logs
+   - Key rotation events
 
 ## Troubleshooting
 
-1. Check CloudWatch Logs for the Lambda function
-2. Verify SES email configuration
-3. Ensure IAM permissions are correct
-4. Check Secrets Manager for key storage
-5. Monitor API logs for credential access issues
+1. **Key Rotation Issues**:
+   - Check CloudWatch logs for Lambda function
+   - Verify IAM permissions
+   - Check SES configuration
 
-## Development
+2. **API Issues**:
+   - Verify API key
+   - Check Secrets Manager access
+   - Review API logs
 
-1. Run the API locally:
-   ```bash
-   uvicorn src.api:app --reload
-   ```
+## Contributing
 
-2. Run tests:
-   ```bash
-   pytest
-   ```
+1. Fork the repository
+2. Create a feature branch
+3. Commit your changes
+4. Push to the branch
+5. Create a Pull Request
 
 ## License
 
