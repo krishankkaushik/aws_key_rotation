@@ -68,10 +68,36 @@ Resources:
           import json
           import logging
           import datetime
+          import os
           
           # Configure logging
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
+          
+          def send_notification(ses_client, subject, body):
+              """Send email notification"""
+              try:
+                  response = ses_client.send_email(
+                      Source=os.environ['SENDER_EMAIL'],
+                      Destination={
+                          'ToAddresses': [os.environ['ADMIN_EMAIL']]
+                      },
+                      Message={
+                          'Subject': {
+                              'Data': subject
+                          },
+                          'Body': {
+                              'Text': {
+                                  'Data': body
+                              }
+                          }
+                      }
+                  )
+                  logger.info(f"Email sent successfully: {response['MessageId']}")
+                  return True
+              except Exception as e:
+                  logger.error(f"Failed to send email: {str(e)}")
+                  return False
           
           def lambda_handler(event, context):
               """Lambda handler for key rotation"""
@@ -81,6 +107,7 @@ Resources:
                   
                   # Initialize AWS clients
                   iam = boto3.client('iam')
+                  ses = boto3.client('ses')
                   
                   # List all IAM users
                   response = iam.list_users()
@@ -100,26 +127,52 @@ Resources:
                       keys = iam.list_access_keys(UserName=username)
                       logger.info(f"Found {len(keys['AccessKeyMetadata'])} keys for {username}")
                       
-                      # Create new key
-                      new_key = iam.create_access_key(UserName=username)
-                      logger.info(f"Created new key for {username}")
+                      # Sort keys by creation time (oldest first)
+                      sorted_keys = sorted(keys['AccessKeyMetadata'], key=lambda x: x['CreateDate'])
+                      current_time = datetime.datetime.now(datetime.timezone.utc)
                       
-                      # Deactivate old keys
-                      for key in keys['AccessKeyMetadata']:
-                          if key['Status'] == 'Active':
+                      # Process existing keys
+                      for key in sorted_keys:
+                          key_create_time = key['CreateDate']
+                          age_minutes = (current_time - key_create_time).total_seconds() / 60
+                          
+                          # Deactivate keys older than 12 minutes
+                          if key['Status'] == 'Active' and age_minutes >= 12:
                               iam.update_access_key(
                                   UserName=username,
                                   AccessKeyId=key['AccessKeyId'],
                                   Status='Inactive'
                               )
-                              logger.info(f"Deactivated old key {key['AccessKeyId']} for {username}")
-                              
-                              # Delete old key
+                              logger.info(f"Deactivated key {key['AccessKeyId']} for {username} (age: {age_minutes:.1f} minutes)")
+                              send_notification(
+                                  ses,
+                                  f"IAM Key Deactivated - {username}",
+                                  f"Access key {key['AccessKeyId']} for user {username} has been deactivated after {age_minutes:.1f} minutes."
+                              )
+                          
+                          # Delete keys older than 15 minutes
+                          if age_minutes >= 15:
                               iam.delete_access_key(
                                   UserName=username,
                                   AccessKeyId=key['AccessKeyId']
                               )
-                              logger.info(f"Deleted old key {key['AccessKeyId']} for {username}")
+                              logger.info(f"Deleted key {key['AccessKeyId']} for {username} (age: {age_minutes:.1f} minutes)")
+                              send_notification(
+                                  ses,
+                                  f"IAM Key Deleted - {username}",
+                                  f"Access key {key['AccessKeyId']} for user {username} has been deleted after {age_minutes:.1f} minutes."
+                              )
+                      
+                      # Create new key every 10 minutes
+                      active_keys = [k for k in keys['AccessKeyMetadata'] if k['Status'] == 'Active']
+                      if len(active_keys) < 2:  # Maintain 2 active keys
+                          new_key = iam.create_access_key(UserName=username)
+                          logger.info(f"Created new key for {username}")
+                          send_notification(
+                              ses,
+                              f"New IAM Key Created - {username}",
+                              f"New access key {new_key['AccessKey']['AccessKeyId']} has been created for user {username}."
+                          )
                   
                   logger.info("Key rotation completed successfully")
                   return {
@@ -128,9 +181,18 @@ Resources:
                   }
               except Exception as e:
                   logger.error(f"Error in lambda handler: {str(e)}")
+                  error_msg = f"Error in key rotation: {str(e)}"
+                  try:
+                      send_notification(
+                          ses,
+                          "IAM Key Rotation Error",
+                          error_msg
+                      )
+                  except:
+                      logger.error("Failed to send error notification email")
                   return {
                       'statusCode': 500,
-                      'body': json.dumps(f'Error: {str(e)}')
+                      'body': json.dumps(error_msg)
                   }
 
   KeyRotationRule:
