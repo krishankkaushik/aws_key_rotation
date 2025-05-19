@@ -1,0 +1,396 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IAM Key Rotation with 10-minute rotation period'
+
+Parameters:
+  SenderEmail:
+    Type: String
+    Description: 'Sender email address for notifications'
+  
+  AdminEmail:
+    Type: String
+    Description: 'Admin email address for notifications'
+
+Resources:
+  KeyRotationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KeyRotationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:CreateAccessKey
+                  - iam:DeleteAccessKey
+                  - iam:ListAccessKeys
+                  - iam:UpdateAccessKey
+                  - iam:GetUser
+                  - iam:ListUserTags
+                  - iam:ListUsers
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:CreateSecret
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+
+  KeyRotationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt KeyRotationRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Environment:
+        Variables:
+          SENDER_EMAIL: !Ref SenderEmail
+          ADMIN_EMAIL: !Ref AdminEmail
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import datetime
+          import os
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def get_active_key(username):
+              """Get the active key for a user"""
+              try:
+                  iam = boto3.client('iam')
+                  keys = iam.list_access_keys(UserName=username)
+                  
+                  # Find the active key
+                  active_key = None
+                  for key in keys['AccessKeyMetadata']:
+                      if key['Status'] == 'Active':
+                          active_key = key
+                          break
+                  
+                  if not active_key:
+                      return None
+                  
+                  # Get the secret key from Secrets Manager
+                  secrets = boto3.client('secretsmanager')
+                  secret_value = secrets.get_secret_value(SecretId=username)
+                  secret_data = json.loads(secret_value['SecretString'])
+                  
+                  return {
+                      'AccessKeyId': active_key['AccessKeyId'],
+                      'SecretAccessKey': secret_data['SecretAccessKey']
+                  }
+              except Exception as e:
+                  logger.error(f"Error getting active key: {str(e)}")
+                  return None
+          
+          def lambda_handler(event, context):
+              """Lambda handler for key rotation and API requests"""
+              try:
+                  logger.info("Lambda function started")
+                  logger.info(f"Event: {json.dumps(event)}")
+                  
+                  # Check if this is an API Gateway request
+                  if 'queryStringParameters' in event:
+                      logger.info("Processing API request")
+                      username = event.get('queryStringParameters', {}).get('username')
+                      if not username:
+                          return {
+                              'statusCode': 400,
+                              'body': json.dumps({'error': 'Username is required'}),
+                              'headers': {
+                                  'Access-Control-Allow-Origin': '*'
+                              }
+                          }
+                      
+                      active_key = get_active_key(username)
+                      if not active_key:
+                          return {
+                              'statusCode': 404,
+                              'body': json.dumps({'error': 'No active key found'}),
+                              'headers': {
+                                  'Access-Control-Allow-Origin': '*'
+                              }
+                          }
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps(active_key),
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*'
+                          }
+                      }
+                  
+                  # Regular key rotation event
+                  logger.info("Starting key rotation process")
+                  iam = boto3.client('iam')
+                  response = iam.list_users()
+                  logger.info(f"Found {len(response['Users'])} users")
+                  
+                  for user in response['Users']:
+                      username = user['UserName']
+                      logger.info(f"Processing user: {username}")
+                      
+                      # Skip AWS service accounts
+                      if username.startswith('AWS-'):
+                          logger.info(f"Skipping AWS service account: {username}")
+                          continue
+                      
+                      # List access keys
+                      keys = iam.list_access_keys(UserName=username)
+                      logger.info(f"Found {len(keys['AccessKeyMetadata'])} keys for {username}")
+                      
+                      # Sort keys by creation time (oldest first)
+                      sorted_keys = sorted(keys['AccessKeyMetadata'], key=lambda x: x['CreateDate'])
+                      current_time = datetime.datetime.now(datetime.timezone.utc)
+                      
+                      # Process existing keys
+                      for key in sorted_keys:
+                          key_create_time = key['CreateDate']
+                          age_minutes = (current_time - key_create_time).total_seconds() / 60
+                          
+                          # Deactivate keys older than 12 minutes
+                          if key['Status'] == 'Active' and age_minutes >= 12:
+                              iam.update_access_key(
+                                  UserName=username,
+                                  AccessKeyId=key['AccessKeyId'],
+                                  Status='Inactive'
+                              )
+                              logger.info(f"Deactivated key {key['AccessKeyId']} for {username} (age: {age_minutes:.1f} minutes)")
+                          
+                          # Delete keys older than 15 minutes
+                          if age_minutes >= 15:
+                              iam.delete_access_key(
+                                  UserName=username,
+                                  AccessKeyId=key['AccessKeyId']
+                              )
+                              logger.info(f"Deleted key {key['AccessKeyId']} for {username} (age: {age_minutes:.1f} minutes)")
+                      
+                      # Create new key every 10 minutes
+                      active_keys = [k for k in keys['AccessKeyMetadata'] if k['Status'] == 'Active']
+                      if len(active_keys) < 2:  # Maintain 2 active keys
+                          new_key = iam.create_access_key(UserName=username)
+                          logger.info(f"Created new key for {username}")
+                          
+                          # Store the new key in Secrets Manager
+                          secrets = boto3.client('secretsmanager')
+                          secrets.put_secret_value(
+                              SecretId=username,
+                              SecretString=json.dumps({
+                                  'AccessKeyId': new_key['AccessKey']['AccessKeyId'],
+                                  'SecretAccessKey': new_key['AccessKey']['SecretAccessKey']
+                              })
+                          )
+                  
+                  logger.info("Key rotation completed successfully")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Key rotation completed')
+                  }
+              except Exception as e:
+                  logger.error(f"Error in lambda handler: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+
+  KeyRotationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: KeyRotationRule
+      Description: 'Trigger key rotation every 10 minutes'
+      ScheduleExpression: 'rate(10 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt KeyRotationFunction.Arn
+          Id: KeyRotationFunction
+
+  KeyRotationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref KeyRotationFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt KeyRotationRule.Arn
+
+  InitialRotationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: InitialRotationRule
+      Description: 'Trigger initial key rotation'
+      EventPattern:
+        source:
+          - aws.cloudformation
+        detail-type:
+          - AWS CloudFormation Stack Status Change
+        detail:
+          stack-name:
+            - !Ref AWS::StackName
+          status-details:
+            status:
+              - CREATE_COMPLETE
+              - UPDATE_COMPLETE
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt KeyRotationFunction.Arn
+          Id: InitialRotationFunction
+
+  InitialRotationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref KeyRotationFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InitialRotationRule.Arn
+
+  KeyRotationApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: KeyRotationAPI
+      Description: API for AWS IAM key rotation
+
+  KeyRotationApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref KeyRotationApi
+      ParentId: !GetAtt KeyRotationApi.RootResourceId
+      PathPart: active-key
+
+  KeyRotationApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref KeyRotationApi
+      ResourceId: !Ref KeyRotationApiResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${KeyRotationFunction.Arn}/invocations
+        RequestParameters:
+          integration.request.querystring.username: method.request.querystring.username
+      RequestParameters:
+        method.request.querystring.username: true
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 400
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 404
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 500
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  KeyRotationApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: KeyRotationApiMethod
+    Properties:
+      RestApiId: !Ref KeyRotationApi
+
+  KeyRotationApiStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: KeyRotationApiDeployment
+    Properties:
+      RestApiId: !Ref KeyRotationApi
+      DeploymentId: !Ref KeyRotationApiDeployment
+      StageName: prod
+
+  KeyRotationApiPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: KeyRotationApiStage
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref KeyRotationFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${KeyRotationApi}/*/*/*
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: KeyRotationApiStage
+    Properties:
+      Name: !Sub ${AWS::StackName}-${AWS::Region}-api-key
+      Description: API Key for accessing the key rotation API
+      Enabled: true
+      Value: !Sub ${AWS::StackName}-${AWS::Region}-${AWS::AccountId}
+
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: 
+      - KeyRotationApiStage
+      - ApiKey
+    Properties:
+      Description: Usage plan for key rotation API
+      ApiStages:
+        - ApiId: !Ref KeyRotationApi
+          Stage: prod
+      Throttle:
+        RateLimit: 100
+        BurstLimit: 200
+      Quota:
+        Limit: 1000
+        Period: DAY
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    DependsOn: UsagePlan
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  ApiEndpointSecret:
+    Type: AWS::SecretsManager::Secret
+    DependsOn: KeyRotationApiStage
+    Properties:
+      Name: !Sub ${AWS::StackName}-${AWS::Region}-api-endpoint
+      Description: API endpoint URL
+      SecretString: !Sub '{"endpoint": "https://${KeyRotationApi}.execute-api.${AWS::Region}.amazonaws.com/prod/active-key"}'
+
+Outputs:
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt KeyRotationFunction.Arn
+    Export:
+      Name: KeyRotationLambdaArn
+
+  EventRuleArn:
+    Description: 'ARN of the EventBridge rule'
+    Value: !GetAtt KeyRotationRule.Arn
+    Export:
+      Name: KeyRotationEventRuleArn
+
+  ApiEndpoint:
+    Description: 'API Gateway endpoint URL'
+    Value: !Sub 'https://${KeyRotationApi}.execute-api.${AWS::Region}.amazonaws.com/prod/active-key'
+    Export:
+      Name: KeyRotationApiEndpoint
+
+  ApiKey:
+    Description: 'API Key for accessing the endpoint'
+    Value: !Sub '${AWS::StackName}-${AWS::Region}-${AWS::AccountId}'
+    Export:
+      Name: KeyRotationApiKey 
