@@ -1,123 +1,138 @@
 # AWS IAM Key Rotation System
 
-This system provides automated rotation of AWS IAM access keys with the following features:
+A secure and automated system for rotating AWS IAM access keys with API access to retrieve active credentials.
 
-1. **Automated Key Rotation**:
-   - Keys are rotated every 5 minutes
-   - Old keys are deactivated after 2 minutes
-   - Deactivated keys are deleted after 1 minute
-   - Email notifications for all key events
+## 🌟 Features
 
-2. **Secure Key Storage**:
-   - Keys are stored in AWS Secrets Manager
-   - No hardcoding of keys in code
-   - Proper access controls and encryption
+- **Automated Key Rotation**: Automatically rotates IAM access keys every 10 minutes
+- **Multiple Active Keys**: Maintains two active keys per user for zero-downtime rotation
+- **Secure Key Management**: 
+  - Keys are deactivated after 12 minutes
+  - Keys are deleted after 15 minutes
+  - All operations are logged
+- **API Access**: REST API to retrieve active credentials for any IAM user
+- **Email Notifications**: Configurable email notifications for key rotation events
+- **CloudFormation Deployment**: Easy deployment using AWS CloudFormation
 
-3. **Flexible Access Patterns**:
-   - Direct API access for CI/CD pipelines
-   - REST API for programmatic access
-   - Email notifications with API usage instructions
+## 🚀 Quick Start
 
-## Prerequisites
+### Prerequisites
 
-- Python 3.9+
+- Python 3.9 or higher
 - AWS CLI configured with appropriate permissions
-- AWS SES configured for email notifications
+- AWS SES verified email addresses (for notifications)
 
-## Setup
+### Installation
 
-1. **Install Dependencies**:
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/yourusername/aws-key-rotation.git
+   cd aws-key-rotation
+   ```
+
+2. Create and activate a virtual environment:
    ```bash
    python -m venv .venv
-   source .venv/bin/activate
+   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+   ```
+
+3. Install dependencies:
+   ```bash
    pip install -r requirements.txt
    ```
 
-2. **Deploy CloudFormation Stack**:
+### Deployment
+
+1. Deploy the stack using the deployment script:
    ```bash
-   aws cloudformation deploy \
-     --template-file key_rotation.yaml \
-     --stack-name iam-key-rotation \
-     --parameter-overrides \
-       SenderEmail=your-email@example.com \
-       AdminEmail=admin@example.com \
-     --capabilities CAPABILITY_IAM
+   python deploy.py --admin-email your-admin@email.com --sender-email your-sender@email.com
    ```
 
-3. **Configure Environment Variables**:
+   Optional flags:
+   - `--cleanup`: Clean up existing resources before deployment
+   - `--skip-email-verification`: Skip SES email verification (not recommended for production)
+
+2. The script will:
+   - Verify email addresses in AWS SES
+   - List existing IAM users
+   - Deploy the CloudFormation stack
+   - Display API credentials for testing
+
+## 🔑 Using the API
+
+After deployment, you'll receive API credentials. Use them to retrieve active credentials for any IAM user:
+
+```bash
+curl -H "x-api-key: YOUR_API_KEY" "YOUR_API_ENDPOINT?username=USERNAME"
+```
+
+Example response:
+```json
+{
+    "AccessKeyId": "AKIAXXXXXXXXXXXXXXXX",
+    "SecretAccessKey": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+}
+```
+
+## 🔄 Key Rotation Schedule
+
+- **Every 10 minutes**: New key is created
+- **After 12 minutes**: Old key is deactivated
+- **After 15 minutes**: Old key is deleted
+- **Always**: Two active keys are maintained per user
+
+## 🏗️ Architecture
+
+The system consists of the following AWS resources:
+
+- **Lambda Function**: Handles key rotation and API requests
+- **EventBridge Rule**: Triggers key rotation every 10 minutes
+- **API Gateway**: Provides REST API access
+- **Secrets Manager**: Securely stores API credentials
+- **IAM Roles**: Manages permissions for the Lambda function
+- **CloudWatch Logs**: Logs all operations
+
+## 🔒 Security Considerations
+
+- API access is protected with API keys
+- IAM roles follow the principle of least privilege
+- Keys are automatically rotated and cleaned up
+- All operations are logged for audit purposes
+- Email notifications for important events
+
+## 🧪 Testing
+
+1. Create test IAM users:
    ```bash
-   export API_KEY=your-secure-api-key
+   aws iam create-user --user-name test-user-1
    ```
 
-4. **Start the API Server**:
+2. Test the API:
    ```bash
-   python api.py
+   curl -H "x-api-key: YOUR_API_KEY" "YOUR_API_ENDPOINT?username=test-user-1"
    ```
 
-## Usage
-
-### API Endpoints
-
-1. **Get Credentials for a User**:
+3. Monitor key rotation:
    ```bash
-   curl -H "X-API-Key: your-api-key" http://localhost:8000/credentials/username
+   aws iam list-access-keys --user-name test-user-1
    ```
 
-2. **Get All Credentials**:
-   ```bash
-   curl -H "X-API-Key: your-api-key" http://localhost:8000/credentials
-   ```
+## 🧹 Cleanup
 
-### Email Notifications
+To remove all resources:
 
-The system sends email notifications for the following events:
-1. New key creation
-2. Key deactivation
-3. Key deletion
+```bash
+python deploy.py --admin-email your-admin@email.com --sender-email your-sender@email.com --cleanup
+```
 
-Each email includes:
-- Event details
-- Timestamp
-- API usage instructions
-- Security best practices
+## 📝 License
 
-## Security Considerations
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-1. **API Security**:
-   - All API endpoints require an API key
-   - API key should be rotated regularly
-   - Use HTTPS in production
+## 🤝 Contributing
 
-2. **Key Storage**:
-   - Keys are encrypted at rest in Secrets Manager
-   - Access is controlled via IAM policies
-   - No hardcoded credentials in code
+Contributions are welcome! Please feel free to submit a Pull Request.
 
-3. **Monitoring**:
-   - CloudWatch logs for Lambda function
-   - API access logs
-   - Key rotation events
+## 📧 Support
 
-## Troubleshooting
-
-1. **Key Rotation Issues**:
-   - Check CloudWatch logs for Lambda function
-   - Verify IAM permissions
-   - Check SES configuration
-
-2. **API Issues**:
-   - Verify API key
-   - Check Secrets Manager access
-   - Review API logs
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details. 
+For support, please open an issue in the GitHub repository. 

@@ -7,6 +7,8 @@ import time
 import argparse
 import sys
 from botocore.exceptions import ClientError
+import random
+import string
 
 # Configure logging
 logging.basicConfig(
@@ -27,6 +29,7 @@ class KeyRotationDeployer:
         self.iam = boto3.client('iam')
         self.cf = boto3.client('cloudformation')
         self.secrets = boto3.client('secretsmanager')
+        self.ssm = boto3.client('ssm')
         
         # Load CloudFormation template
         with open('key_rotation_simple.yaml', 'r') as f:
@@ -57,9 +60,31 @@ class KeyRotationDeployer:
             logger.error(f"Error listing users: {str(e)}")
             raise
     
+    def store_api_key(self):
+        """Store API key in SSM Parameter Store"""
+        try:
+            # Generate a random API key
+            api_key = ''.join(random.choices(string.ascii_letters + string.digits, k=20))
+            
+            # Store in SSM Parameter Store
+            self.ssm.put_parameter(
+                Name='/apigateway/key-rotation/api-key',
+                Value=api_key,
+                Type='String',
+                Overwrite=True
+            )
+            logger.info("API key stored in SSM Parameter Store")
+            return api_key
+        except ClientError as e:
+            logger.error(f"Error storing API key: {str(e)}")
+            raise
+    
     def deploy_cloudformation(self):
         """Deploy CloudFormation stack"""
         try:
+            # Store API key first
+            self.store_api_key()
+            
             # Check if stack exists
             try:
                 self.cf.describe_stacks(StackName=self.stack_name)
@@ -93,8 +118,43 @@ class KeyRotationDeployer:
             waiter.wait(StackName=self.stack_name)
             logger.info("Stack deployment completed successfully")
             
+            # Get API credentials
+            self.display_api_credentials()
+            
         except ClientError as e:
             logger.error(f"Error deploying stack: {str(e)}")
+            raise
+    
+    def display_api_credentials(self):
+        """Fetch and display API credentials"""
+        try:
+            # Get API key from CloudFormation outputs
+            response = self.cf.describe_stacks(StackName=self.stack_name)
+            outputs = response['Stacks'][0]['Outputs']
+            
+            api_key = None
+            api_endpoint = None
+            
+            for output in outputs:
+                if output['OutputKey'] == 'ApiKey':
+                    api_key = output['OutputValue']
+                elif output['OutputKey'] == 'ApiEndpoint':
+                    api_endpoint = output['OutputValue']
+            
+            if not api_key or not api_endpoint:
+                raise Exception("Could not find API credentials in stack outputs")
+
+            # Display curl command
+            logger.info("\nAPI Credentials:")
+            logger.info("===============")
+            logger.info(f"API Key: {api_key}")
+            logger.info(f"API Endpoint: {api_endpoint}")
+            logger.info("\nTo get active credentials for a user, use this curl command:")
+            logger.info(f'curl -H "x-api-key: {api_key}" "{api_endpoint}?username=test-user-1"')
+            logger.info("\nReplace 'test-user-1' with any of your IAM users to get their active credentials.")
+
+        except ClientError as e:
+            logger.error(f"Error fetching API credentials: {str(e)}")
             raise
     
     def cleanup(self):
