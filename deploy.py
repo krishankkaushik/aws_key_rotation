@@ -61,19 +61,19 @@ class KeyRotationDeployer:
             raise
     
     def store_api_key(self):
-        """Store API key in SSM Parameter Store"""
+        """Store API key in Secrets Manager"""
         try:
             # Generate a random API key
             api_key = ''.join(random.choices(string.ascii_letters + string.digits, k=20))
             
-            # Store in SSM Parameter Store
+            # Store in Secrets Manager
             self.ssm.put_parameter(
                 Name='/apigateway/key-rotation/api-key',
                 Value=api_key,
                 Type='String',
                 Overwrite=True
             )
-            logger.info("API key stored in SSM Parameter Store")
+            logger.info("API key stored in Secrets Manager")
             return api_key
         except ClientError as e:
             logger.error(f"Error storing API key: {str(e)}")
