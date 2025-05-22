@@ -144,13 +144,16 @@ class KeyRotationDeployer:
             if not api_key or not api_endpoint:
                 raise Exception("Could not find API credentials in stack outputs")
 
-            # Display curl command
+            # Print API credentials
             logger.info("\nAPI Credentials:")
             logger.info("===============")
             logger.info(f"API Key: {api_key}")
             logger.info(f"API Endpoint: {api_endpoint}")
-            logger.info("\nTo get active credentials for a user, use this curl command:")
-            logger.info(f'curl -H "x-api-key: {api_key}" "{api_endpoint}?username=test-user-1"')
+            logger.info("\nTo get active credentials for a user, follow these steps:")
+            logger.info("\n1. First, generate a token:")
+            logger.info(f'curl -X POST -H "x-api-key: {api_key}" "{api_endpoint.replace("/active-key", "/generate-token")}"')
+            logger.info("\n2. Then, use the token to get active credentials:")
+            logger.info(f'curl -H "x-api-key: {api_key}" -H "Authorization: Bearer YOUR_TOKEN" "{api_endpoint}?username=test-user-1"')
             logger.info("\nReplace 'test-user-1' with any of your IAM users to get their active credentials.")
 
         except ClientError as e:
