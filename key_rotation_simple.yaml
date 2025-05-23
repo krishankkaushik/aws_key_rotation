@@ -192,14 +192,72 @@ Resources:
                   return None
           
           def lambda_handler(event, context):
-              # API/JWT logic untouched
-              if 'path' in event or 'queryStringParameters' in event:
-                  # Existing API/JWT logic
-                  # ... existing code ...
-                  pass
-              else:
-                  # --- Begin: Working Rotation Logic from key_rotation_copied ---
-                  logger.info("Starting key rotation process (refactored logic)")
+              try:
+                  logger.info(f"Received event: {json.dumps(event)}")
+                  
+                  # Handle API requests
+                  if 'path' in event and 'queryStringParameters' in event:
+                      # Validate token if Authorization header is present
+                      if 'headers' in event and 'Authorization' in event['headers']:
+                          auth_header = event['headers']['Authorization']
+                          if not auth_header.startswith('Bearer '):
+                              return {
+                                  'statusCode': 401,
+                                  'body': json.dumps({'error': 'Invalid authorization header'})
+                              }
+                          
+                          token = auth_header.split(' ')[1]
+                          is_valid, payload = validate_token(token)
+                          if not is_valid:
+                              return {
+                                  'statusCode': 401,
+                                  'body': json.dumps({'error': 'Invalid token'})
+                              }
+                      
+                      # Get username from query parameters
+                      if not event['queryStringParameters'] or 'username' not in event['queryStringParameters']:
+                          return {
+                              'statusCode': 400,
+                              'body': json.dumps({'error': 'Username parameter is required'})
+                          }
+                      
+                      username = event['queryStringParameters']['username']
+                      
+                      # Get credentials from Secrets Manager
+                      try:
+                          secrets = boto3.client('secretsmanager')
+                          secret_id = f"{username}-access-key"
+                          response = secrets.get_secret_value(SecretId=secret_id)
+                          credentials = json.loads(response['SecretString'])
+                          
+                          # Check if credentials are still active
+                          if credentials.get('status') == 'active':
+                              return {
+                                  'statusCode': 200,
+                                  'body': json.dumps({
+                                      'AccessKeyId': credentials['AccessKeyId'],
+                                      'SecretAccessKey': credentials['SecretAccessKey']
+                                  })
+                              }
+                          else:
+                              return {
+                                  'statusCode': 404,
+                                  'body': json.dumps({'error': 'No active credentials found'})
+                              }
+                      except secrets.exceptions.ResourceNotFoundException:
+                          return {
+                              'statusCode': 404,
+                              'body': json.dumps({'error': 'No credentials found for user'})
+                          }
+                      except Exception as e:
+                          logger.error(f"Error getting credentials: {str(e)}")
+                          return {
+                              'statusCode': 500,
+                              'body': json.dumps({'error': 'Internal server error'})
+                          }
+                  
+                  # If not an API request, proceed with key rotation
+                  logger.info("Starting key rotation process")
                   iam = boto3.client('iam')
                   secrets = boto3.client('secretsmanager')
                   users = iam.list_users()['Users']
@@ -252,10 +310,16 @@ Resources:
                                   SecretString=json.dumps(secret_value)
                               )
                               logger.info(f"Updated existing secret for user {username}")
-                  logger.info("Key rotation completed successfully (refactored logic)")
+                  logger.info("Key rotation completed successfully")
                   return {
                       'statusCode': 200,
                       'body': json.dumps({'message': 'Key rotation completed successfully'})
+                  }
+              except Exception as e:
+                  logger.error(f"Error processing request: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': 'Internal server error'})
                   }
 
   KeyRotationSchedule:
@@ -407,6 +471,20 @@ Resources:
     Properties:
       Name: KeyRotationAPI
       Description: API for AWS IAM key rotation
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 'execute-api:Invoke'
+            Resource: 'execute-api:/*'
+          - Effect: Deny
+            Principal: '*'
+            Action: 'execute-api:Invoke'
+            Resource: 'execute-api:/*'
+            Condition:
+              NotIpAddress:
+                aws:SourceIp: ['125.63.109.230']
 
   KeyRotationApiResource:
     Type: AWS::ApiGateway::Resource
@@ -581,9 +659,9 @@ Resources:
                   response = secrets.get_secret_value(SecretId=os.environ['JWT_SECRET_ARN'])
                   jwt_secret = json.loads(response['SecretString'])['secret']
                   
-                  # Generate JWT token with 5-minute expiration
+                  # Generate JWT token with 2-minute expiration
                   payload = {
-                      'exp': int(time.time()) + 300,  # 5 minutes from now
+                      'exp': int(time.time()) + 120,  # 2 minutes from now
                       'iat': int(time.time())
                   }
                   
