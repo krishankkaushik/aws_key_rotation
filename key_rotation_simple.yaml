@@ -44,7 +44,13 @@ Resources:
                   - secretsmanager:PutSecretValue
                   - secretsmanager:DescribeSecret
                   - secretsmanager:CreateSecret
-                Resource: '*'
+                  - secretsmanager:UpdateSecret
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:TagResource
+                  - secretsmanager:UntagResource
+                  - secretsmanager:ListSecrets
+                Resource: 
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*'
               - Effect: Allow
                 Action:
                   - ses:SendEmail
@@ -54,6 +60,7 @@ Resources:
   KeyRotationFunction:
     Type: AWS::Lambda::Function
     Properties:
+      FunctionName: !Sub ${AWS::StackName}-key-rotation
       Handler: index.lambda_handler
       Role: !GetAtt KeyRotationRole.Arn
       Runtime: python3.9
@@ -62,175 +69,380 @@ Resources:
         Variables:
           SENDER_EMAIL: !Ref SenderEmail
           ADMIN_EMAIL: !Ref AdminEmail
+          JWT_SECRET_ARN: !Ref JwtSecret
       Code:
         ZipFile: |
-          import boto3
           import json
+          import boto3
           import logging
-          import datetime
+          import time
           import os
+          from datetime import datetime, timezone, timedelta
+          from botocore.exceptions import ClientError
+          
+          # PyJWT implementation
+          import base64
+          import hmac
+          import hashlib
+          import time
+          
+          def jwt_encode(payload, secret, algorithm='HS256'):
+              header = {'typ': 'JWT', 'alg': algorithm}
+              segments = []
+              
+              # Encode header
+              header_bytes = json.dumps(header).encode('utf-8')
+              header_b64 = base64.urlsafe_b64encode(header_bytes).decode('utf-8').rstrip('=')
+              segments.append(header_b64)
+              
+              # Encode payload
+              payload_bytes = json.dumps(payload).encode('utf-8')
+              payload_b64 = base64.urlsafe_b64encode(payload_bytes).decode('utf-8').rstrip('=')
+              segments.append(payload_b64)
+              
+              # Create signature
+              msg = f"{header_b64}.{payload_b64}".encode('utf-8')
+              signature = hmac.new(secret.encode('utf-8'), msg, hashlib.sha256).digest()
+              signature_b64 = base64.urlsafe_b64encode(signature).decode('utf-8').rstrip('=')
+              segments.append(signature_b64)
+              
+              return '.'.join(segments)
+          
+          def jwt_decode(token, secret, algorithms=['HS256']):
+              try:
+                  # Split token
+                  parts = token.split('.')
+                  if len(parts) != 3:
+                      raise ValueError('Invalid token format')
+                  
+                  # Decode header and payload
+                  header_b64 = parts[0] + '=' * (-len(parts[0]) % 4)
+                  payload_b64 = parts[1] + '=' * (-len(parts[1]) % 4)
+                  
+                  header = json.loads(base64.urlsafe_b64decode(header_b64).decode('utf-8'))
+                  payload = json.loads(base64.urlsafe_b64decode(payload_b64).decode('utf-8'))
+                  
+                  # Verify signature
+                  msg = f"{parts[0]}.{parts[1]}".encode('utf-8')
+                  signature = hmac.new(secret.encode('utf-8'), msg, hashlib.sha256).digest()
+                  signature_b64 = base64.urlsafe_b64encode(signature).decode('utf-8').rstrip('=')
+                  
+                  if signature_b64 != parts[2]:
+                      raise ValueError('Invalid signature')
+                  
+                  # Check expiration
+                  if 'exp' in payload and payload['exp'] < time.time():
+                      raise ValueError('Token has expired')
+                  
+                  return payload
+              except Exception as e:
+                  raise ValueError(f'Invalid token: {str(e)}')
           
           # Configure logging
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
           
-          def get_active_key(username):
-              """Get the active key for a user"""
+          def validate_token(token):
               try:
-                  iam = boto3.client('iam')
-                  keys = iam.list_access_keys(UserName=username)
+                  # Get JWT secret from Secrets Manager
+                  secrets_client = boto3.client('secretsmanager')
+                  secret = secrets_client.get_secret_value(SecretId=os.environ['JWT_SECRET_ARN'])
+                  secret_dict = json.loads(secret['SecretString'])
+                  secret_key = secret_dict['secret']
                   
-                  # Find the active key
-                  active_key = None
-                  for key in keys['AccessKeyMetadata']:
-                      if key['Status'] == 'Active':
-                          active_key = key
-                          break
-                  
-                  if not active_key:
-                      return None
-                  
-                  # Get the secret key from Secrets Manager
-                  secrets = boto3.client('secretsmanager')
-                  secret_value = secrets.get_secret_value(SecretId=username)
-                  secret_data = json.loads(secret_value['SecretString'])
-                  
-                  return {
-                      'AccessKeyId': active_key['AccessKeyId'],
-                      'SecretAccessKey': secret_data['SecretAccessKey']
-                  }
+                  # Validate token
+                  payload = jwt_decode(token, secret_key)
+                  return True, payload
               except Exception as e:
-                  logger.error(f"Error getting active key: {str(e)}")
+                  return False, str(e)
+          
+          def create_new_key(iam, secrets, username):
+              """Create a new key for a user and store it in Secrets Manager"""
+              try:
+                  new_key = iam.create_access_key(UserName=username)
+                  logger.info(f"Created new key for user {username}")
+                  
+                  # Store new key in Secrets Manager
+                  secret_name = f"{username}-access-key"
+                  secret_value = {
+                      'AccessKeyId': new_key['AccessKey']['AccessKeyId'],
+                      'SecretAccessKey': new_key['AccessKey']['SecretAccessKey'],
+                      'CreateDate': datetime.now(timezone.utc).isoformat()
+                  }
+                  
+                  try:
+                      secrets.create_secret(
+                          Name=secret_name,
+                          SecretString=json.dumps(secret_value)
+                      )
+                      logger.info(f"Stored new key in Secrets Manager for user {username}")
+                  except ClientError as e:
+                      if e.response['Error']['Code'] == 'ResourceExistsException':
+                          secrets.update_secret(
+                              SecretId=secret_name,
+                              SecretString=json.dumps(secret_value)
+                          )
+                          logger.info(f"Updated existing secret in Secrets Manager for user {username}")
+                      else:
+                          raise
+                  
+                  return new_key
+              except Exception as e:
+                  logger.error(f"Error creating new key for user {username}: {str(e)}")
                   return None
           
           def lambda_handler(event, context):
-              """Lambda handler for key rotation and API requests"""
               try:
-                  logger.info("Lambda function started")
-                  logger.info(f"Event: {json.dumps(event)}")
+                  logger.info(f"Received event: {json.dumps(event)}")
                   
-                  # Check if this is an API Gateway request
-                  if 'queryStringParameters' in event:
-                      logger.info("Processing API request")
-                      username = event.get('queryStringParameters', {}).get('username')
-                      if not username:
+                  # Handle API requests
+                  if 'path' in event and 'queryStringParameters' in event:
+                      # Validate token if Authorization header is present
+                      if 'headers' in event and 'Authorization' in event['headers']:
+                          auth_header = event['headers']['Authorization']
+                          if not auth_header.startswith('Bearer '):
+                              return {
+                                  'statusCode': 401,
+                                  'body': json.dumps({'error': 'Invalid authorization header'})
+                              }
+                          
+                          token = auth_header.split(' ')[1]
+                          is_valid, payload = validate_token(token)
+                          if not is_valid:
+                              return {
+                                  'statusCode': 401,
+                                  'body': json.dumps({'error': 'Invalid token'})
+                              }
+                      
+                      # Get username from query parameters
+                      if not event['queryStringParameters'] or 'username' not in event['queryStringParameters']:
                           return {
                               'statusCode': 400,
-                              'body': json.dumps({'error': 'Username is required'}),
-                              'headers': {
-                                  'Access-Control-Allow-Origin': '*'
-                              }
+                              'body': json.dumps({'error': 'Username parameter is required'})
                           }
                       
-                      active_key = get_active_key(username)
-                      if not active_key:
+                      username = event['queryStringParameters']['username']
+                      
+                      # Get credentials from Secrets Manager
+                      try:
+                          secrets = boto3.client('secretsmanager')
+                          secret_id = f"{username}-access-key"
+                          response = secrets.get_secret_value(SecretId=secret_id)
+                          credentials = json.loads(response['SecretString'])
+                          
+                          # Check if credentials are still active
+                          if credentials.get('status') == 'active':
+                              return {
+                                  'statusCode': 200,
+                                  'body': json.dumps({
+                                      'AccessKeyId': credentials['AccessKeyId'],
+                                      'SecretAccessKey': credentials['SecretAccessKey']
+                                  })
+                              }
+                          else:
+                              return {
+                                  'statusCode': 404,
+                                  'body': json.dumps({'error': 'No active credentials found'})
+                              }
+                      except secrets.exceptions.ResourceNotFoundException:
                           return {
                               'statusCode': 404,
-                              'body': json.dumps({'error': 'No active key found'}),
-                              'headers': {
-                                  'Access-Control-Allow-Origin': '*'
-                              }
+                              'body': json.dumps({'error': 'No credentials found for user'})
                           }
-                      
-                      return {
-                          'statusCode': 200,
-                          'body': json.dumps(active_key),
-                          'headers': {
-                              'Access-Control-Allow-Origin': '*'
+                      except Exception as e:
+                          logger.error(f"Error getting credentials: {str(e)}")
+                          return {
+                              'statusCode': 500,
+                              'body': json.dumps({'error': 'Internal server error'})
                           }
-                      }
                   
-                  # Regular key rotation event
+                  # If not an API request, proceed with key rotation
                   logger.info("Starting key rotation process")
                   iam = boto3.client('iam')
-                  response = iam.list_users()
-                  logger.info(f"Found {len(response['Users'])} users")
-                  
-                  for user in response['Users']:
+                  secrets = boto3.client('secretsmanager')
+                  users = iam.list_users()['Users']
+                  logger.info(f"Found {len(users)} users to process")
+                  current_time = datetime.now(timezone.utc)
+                  for user in users:
                       username = user['UserName']
                       logger.info(f"Processing user: {username}")
-                      
-                      # Skip AWS service accounts
-                      if username.startswith('AWS-'):
-                          logger.info(f"Skipping AWS service account: {username}")
-                          continue
-                      
-                      # List access keys
-                      keys = iam.list_access_keys(UserName=username)
-                      logger.info(f"Found {len(keys['AccessKeyMetadata'])} keys for {username}")
-                      
-                      # Sort keys by creation time (oldest first)
-                      sorted_keys = sorted(keys['AccessKeyMetadata'], key=lambda x: x['CreateDate'])
-                      current_time = datetime.datetime.now(datetime.timezone.utc)
-                      
-                      # Process existing keys
-                      for key in sorted_keys:
-                          key_create_time = key['CreateDate']
-                          age_minutes = (current_time - key_create_time).total_seconds() / 60
-                          
-                          # Deactivate keys older than 12 minutes
-                          if key['Status'] == 'Active' and age_minutes >= 12:
-                              iam.update_access_key(
-                                  UserName=username,
-                                  AccessKeyId=key['AccessKeyId'],
-                                  Status='Inactive'
+                      existing_keys = iam.list_access_keys(UserName=username)['AccessKeyMetadata']
+                      logger.info(f"Found {len(existing_keys)} existing keys for user {username}")
+                      # Get active keys
+                      active_keys = [k for k in existing_keys if k['Status'] == 'Active']
+                      logger.info(f"Found {len(active_keys)} active keys for user {username}")
+                      secret_id = f"{username}-access-key"
+                      # Deactivate old keys (10 min)
+                      for key in active_keys:
+                          key_age = (current_time - key['CreateDate']).total_seconds() / 60
+                          logger.info(f"Key {key['AccessKeyId']} age: {key_age} minutes")
+                          if key_age >= 10:
+                              logger.info(f"Deactivating key {key['AccessKeyId']} for user {username}")
+                              iam.update_access_key(UserName=username, AccessKeyId=key['AccessKeyId'], Status='Inactive')
+                      # Delete very old keys (13 min)
+                      for key in existing_keys:
+                          key_age = (current_time - key['CreateDate']).total_seconds() / 60
+                          if key_age >= 13 and len(existing_keys) > 1:
+                              logger.info(f"Deleting old key {key['AccessKeyId']} for user {username}")
+                              iam.delete_access_key(UserName=username, AccessKeyId=key['AccessKeyId'])
+                      # Create new key if needed (if <2 active keys)
+                      active_keys = [k for k in iam.list_access_keys(UserName=username)['AccessKeyMetadata'] if k['Status'] == 'Active']
+                      if len(active_keys) < 2:
+                          logger.info(f"Creating new key for user {username}")
+                          new_key = iam.create_access_key(UserName=username)['AccessKey']
+                          # Store in Secrets Manager
+                          secret_value = {
+                              'AccessKeyId': new_key['AccessKeyId'],
+                              'SecretAccessKey': new_key['SecretAccessKey'],
+                              'CreateDate': new_key['CreateDate'].isoformat(),
+                              'status': 'active'
+                          }
+                          try:
+                              secrets.create_secret(
+                                  Name=secret_id,
+                                  SecretString=json.dumps(secret_value),
+                                  Description=f'Credentials for user {username}'
                               )
-                              logger.info(f"Deactivated key {key['AccessKeyId']} for {username} (age: {age_minutes:.1f} minutes)")
-                          
-                          # Delete keys older than 15 minutes
-                          if age_minutes >= 15:
-                              iam.delete_access_key(
-                                  UserName=username,
-                                  AccessKeyId=key['AccessKeyId']
+                              logger.info(f"Created new secret for user {username}")
+                          except secrets.exceptions.ResourceExistsException:
+                              secrets.update_secret(
+                                  SecretId=secret_id,
+                                  SecretString=json.dumps(secret_value)
                               )
-                              logger.info(f"Deleted key {key['AccessKeyId']} for {username} (age: {age_minutes:.1f} minutes)")
-                      
-                      # Create new key every 10 minutes
-                      active_keys = [k for k in keys['AccessKeyMetadata'] if k['Status'] == 'Active']
-                      if len(active_keys) < 2:  # Maintain 2 active keys
-                          new_key = iam.create_access_key(UserName=username)
-                          logger.info(f"Created new key for {username}")
-                          
-                          # Store the new key in Secrets Manager
-                          secrets = boto3.client('secretsmanager')
-                          secrets.put_secret_value(
-                              SecretId=username,
-                              SecretString=json.dumps({
-                                  'AccessKeyId': new_key['AccessKey']['AccessKeyId'],
-                                  'SecretAccessKey': new_key['AccessKey']['SecretAccessKey']
-                              })
-                          )
-                  
+                              logger.info(f"Updated existing secret for user {username}")
                   logger.info("Key rotation completed successfully")
                   return {
                       'statusCode': 200,
-                      'body': json.dumps('Key rotation completed')
+                      'body': json.dumps({'message': 'Key rotation completed successfully'})
                   }
               except Exception as e:
-                  logger.error(f"Error in lambda handler: {str(e)}")
+                  logger.error(f"Error processing request: {str(e)}")
                   return {
                       'statusCode': 500,
-                      'body': json.dumps(f'Error: {str(e)}')
+                      'body': json.dumps({'error': 'Internal server error'})
                   }
 
-  KeyRotationRule:
+  KeyRotationSchedule:
     Type: AWS::Events::Rule
     Properties:
-      Name: KeyRotationRule
-      Description: 'Trigger key rotation every 10 minutes'
-      ScheduleExpression: 'rate(10 minutes)'
+      Description: "Schedule for IAM key rotation every 10 minutes"
+      ScheduleExpression: "rate(10 minutes)"
       State: ENABLED
       Targets:
         - Arn: !GetAtt KeyRotationFunction.Arn
-          Id: KeyRotationFunction
+          Id: "KeyRotationTarget"
 
   KeyRotationPermission:
     Type: AWS::Lambda::Permission
     Properties:
-      Action: lambda:InvokeFunction
+      Action: "lambda:InvokeFunction"
       FunctionName: !Ref KeyRotationFunction
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt KeyRotationSchedule.Arn
+
+  InitialSetupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-initial-setup
+      Handler: index.lambda_handler
+      Role: !GetAtt KeyRotationRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Environment:
+        Variables:
+          SENDER_EMAIL: !Ref SenderEmail
+          ADMIN_EMAIL: !Ref AdminEmail
+          JWT_SECRET_ARN: !Ref JwtSecret
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime, timezone, timedelta
+          from botocore.exceptions import ClientError
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              logger.info(f"Received event: {json.dumps(event)}")
+              
+              iam = boto3.client('iam')
+              secrets = boto3.client('secretsmanager')
+              
+              # Get all IAM users
+              users = iam.list_users()['Users']
+              
+              for user in users:
+                  username = user['UserName']
+                  
+                  # Skip users that don't need rotation
+                  if username.startswith('AWS-') or username == 'admin':
+                      continue
+                  
+                  try:
+                      logger.info(f"Processing user {username}")
+                      
+                      # Get current access keys
+                      keys = iam.list_access_keys(UserName=username)['AccessKeyMetadata']
+                      
+                      # Delete any existing keys
+                      for key in keys:
+                          try:
+                              iam.delete_access_key(UserName=username, AccessKeyId=key['AccessKeyId'])
+                              logger.info(f"Deleted existing key {key['AccessKeyId']} for user {username}")
+                          except Exception as e:
+                              logger.error(f"Error deleting key {key['AccessKeyId']} for user {username}: {str(e)}")
+                      
+                      # Create new key
+                      try:
+                          new_key = iam.create_access_key(UserName=username)
+                          logger.info(f"Created new key for user {username}")
+                          
+                          # Store new key in Secrets Manager
+                          secret_name = f"{username}-access-key"
+                          secret_value = {
+                              'AccessKeyId': new_key['AccessKey']['AccessKeyId'],
+                              'SecretAccessKey': new_key['AccessKey']['SecretAccessKey'],
+                              'CreateDate': datetime.now(timezone.utc).isoformat()
+                          }
+                          
+                          try:
+                              secrets.create_secret(
+                                  Name=secret_name,
+                                  SecretString=json.dumps(secret_value)
+                              )
+                              logger.info(f"Stored new key in Secrets Manager for user {username}")
+                          except ClientError as e:
+                              if e.response['Error']['Code'] == 'ResourceExistsException':
+                                  secrets.update_secret(
+                                      SecretId=secret_name,
+                                      SecretString=json.dumps(secret_value)
+                                  )
+                                  logger.info(f"Updated existing secret in Secrets Manager for user {username}")
+                              else:
+                                  raise
+                      except Exception as e:
+                          logger.error(f"Error creating new key for user {username}: {str(e)}")
+                          continue
+                  except Exception as e:
+                      logger.error(f"Error processing user {username}: {str(e)}")
+                      continue
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'message': 'Initial setup completed successfully'})
+              }
+
+  InitialSetupPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref InitialSetupFunction
       Principal: events.amazonaws.com
-      SourceArn: !GetAtt KeyRotationRule.Arn
+      SourceArn: !GetAtt InitialRotationRule.Arn
 
   InitialRotationRule:
     Type: AWS::Events::Rule
@@ -251,22 +463,28 @@ Resources:
               - UPDATE_COMPLETE
       State: ENABLED
       Targets:
-        - Arn: !GetAtt KeyRotationFunction.Arn
-          Id: InitialRotationFunction
-
-  InitialRotationPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !Ref KeyRotationFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt InitialRotationRule.Arn
+        - Arn: !GetAtt InitialSetupFunction.Arn
+          Id: InitialSetupFunction
 
   KeyRotationApi:
     Type: AWS::ApiGateway::RestApi
     Properties:
       Name: KeyRotationAPI
       Description: API for AWS IAM key rotation
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 'execute-api:Invoke'
+            Resource: 'execute-api:/*'
+          - Effect: Deny
+            Principal: '*'
+            Action: 'execute-api:Invoke'
+            Resource: 'execute-api:/*'
+            Condition:
+              NotIpAddress:
+                aws:SourceIp: ['125.63.109.230']
 
   KeyRotationApiResource:
     Type: AWS::ApiGateway::Resource
@@ -370,6 +588,135 @@ Resources:
       Description: API endpoint URL
       SecretString: !Sub '{"endpoint": "https://${KeyRotationApi}.execute-api.${AWS::Region}.amazonaws.com/prod/active-key"}'
 
+  JwtSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AWS::StackName}-jwt-secret
+      Description: JWT secret key for token generation
+      GenerateSecretString:
+        SecretStringTemplate: '{"secret": "REPLACE_ME"}'
+        GenerateStringKey: "secret"
+        ExcludeCharacters: '"@/\'
+
+  TokenGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-token-generator
+      Handler: index.lambda_handler
+      Role: !GetAtt KeyRotationRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      Environment:
+        Variables:
+          JWT_SECRET_ARN: !Ref JwtSecret
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime, timedelta
+          from botocore.exceptions import ClientError
+          
+          # PyJWT implementation
+          import base64
+          import hmac
+          import hashlib
+          import time
+          
+          def jwt_encode(payload, secret, algorithm='HS256'):
+              header = {'typ': 'JWT', 'alg': algorithm}
+              segments = []
+              
+              # Encode header
+              header_bytes = json.dumps(header).encode('utf-8')
+              header_b64 = base64.urlsafe_b64encode(header_bytes).decode('utf-8').rstrip('=')
+              segments.append(header_b64)
+              
+              # Encode payload
+              payload_bytes = json.dumps(payload).encode('utf-8')
+              payload_b64 = base64.urlsafe_b64encode(payload_bytes).decode('utf-8').rstrip('=')
+              segments.append(payload_b64)
+              
+              # Create signature
+              msg = f"{header_b64}.{payload_b64}".encode('utf-8')
+              signature = hmac.new(secret.encode('utf-8'), msg, hashlib.sha256).digest()
+              signature_b64 = base64.urlsafe_b64encode(signature).decode('utf-8').rstrip('=')
+              segments.append(signature_b64)
+              
+              return '.'.join(segments)
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Received event: {json.dumps(event)}")
+                  
+                  # Get JWT secret from Secrets Manager
+                  secrets = boto3.client('secretsmanager')
+                  response = secrets.get_secret_value(SecretId=os.environ['JWT_SECRET_ARN'])
+                  jwt_secret = json.loads(response['SecretString'])['secret']
+                  
+                  # Generate JWT token with 2-minute expiration
+                  payload = {
+                      'exp': int(time.time()) + 120,  # 2 minutes from now
+                      'iat': int(time.time())
+                  }
+                  
+                  token = jwt_encode(payload, jwt_secret)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'token': token
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error generating token: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  TokenGeneratorApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref KeyRotationApi
+      ParentId: !GetAtt KeyRotationApi.RootResourceId
+      PathPart: generate-token
+
+  TokenGeneratorApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref KeyRotationApi
+      ResourceId: !Ref TokenGeneratorApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TokenGeneratorFunction.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 500
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  TokenGeneratorApiPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: KeyRotationApiStage
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TokenGeneratorFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${KeyRotationApi}/*/*/*
+
 Outputs:
   LambdaFunctionArn:
     Description: 'ARN of the Lambda function'
@@ -379,7 +726,7 @@ Outputs:
 
   EventRuleArn:
     Description: 'ARN of the EventBridge rule'
-    Value: !GetAtt KeyRotationRule.Arn
+    Value: !GetAtt KeyRotationSchedule.Arn
     Export:
       Name: KeyRotationEventRuleArn
 

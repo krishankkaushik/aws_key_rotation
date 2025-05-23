@@ -60,10 +60,25 @@ A secure and automated system for rotating AWS IAM access keys with API access t
 
 ## 🔑 Using the API
 
-After deployment, you'll receive API credentials. Use them to retrieve active credentials for any IAM user:
+After deployment, you'll receive API credentials. The API now uses a two-step authentication process:
 
+1. First, generate a JWT token (valid for 5 minutes):
 ```bash
-curl -H "x-api-key: YOUR_API_KEY" "YOUR_API_ENDPOINT?username=USERNAME"
+curl -X POST -H "x-api-key: YOUR_API_KEY" "YOUR_API_ENDPOINT/generate-token"
+```
+
+Example response:
+```json
+{
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+}
+```
+
+2. Then, use the token to get active credentials:
+```bash
+curl -H "x-api-key: YOUR_API_KEY" \
+     -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+     "YOUR_API_ENDPOINT/active-key?username=USERNAME"
 ```
 
 Example response:
@@ -73,6 +88,8 @@ Example response:
     "SecretAccessKey": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 }
 ```
+
+Note: The JWT token expires after 5 minutes. You'll need to generate a new token after expiration.
 
 ## 🔄 Key Rotation Schedule
 
